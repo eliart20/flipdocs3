@@ -1,0 +1,7 @@
+node_modules/
+dist/
+public/demo.pdf
+public/pdf.worker.min.mjs
+coverage/
+.DS_Store
+*.log
