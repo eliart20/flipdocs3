@@ -179,7 +179,7 @@ export function App() {
             <RangeControl label="Fold height / radius" value={Number(tuning.curlRadius.toFixed(3))} min={0.025} max={0.2} step={0.005} onChange={(value) => updateTuning("curlRadius", value)} />
             <RangeControl label="Minimum fold lift" value={Number(tuning.minimumLift.toFixed(3))} min={0} max={0.06} step={0.002} onChange={(value) => updateTuning("minimumLift", value)} />
             <RangeControl label="Corner preview pull" value={Number(tuning.cornerPull.toFixed(2))} min={0.02} max={0.45} step={0.01} onChange={(value) => updateTuning("cornerPull", value)} />
-            <RangeControl label="Contact shadow" value={Number(tuning.shadowOpacity.toFixed(2))} min={0} max={0.35} step={0.01} onChange={(value) => updateTuning("shadowOpacity", value)} />
+            <RangeControl label="Real page shadow" value={Number(tuning.shadowOpacity.toFixed(2))} min={0} max={0.8} step={0.01} onChange={(value) => updateTuning("shadowOpacity", value)} />
             <RangeControl label="Turn time" value={tuning.turnDuration} min={220} max={1400} step={20} suffix="ms" onChange={(value) => updateTuning("turnDuration", value)} />
           </section>
 

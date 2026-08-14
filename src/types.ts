@@ -57,7 +57,7 @@ export interface FlipBookTuning {
   minimumLift: number;
   /** Vertical pull used by deterministic corner previews (0..0.45 of page height). */
   cornerPull: number;
-  /** Analytic contact-shadow opacity. */
+  /** Opacity of the real-time shadow cast by the turning sheet. */
   shadowOpacity: number;
   /** Canonical turn duration in milliseconds. */
   turnDuration: number;

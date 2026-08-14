@@ -1,10 +1,13 @@
 import {
   Color,
+  DirectionalLight,
   Mesh,
   MeshBasicMaterial,
   OrthographicCamera,
+  PCFSoftShadowMap,
   PlaneGeometry,
   Scene,
+  ShadowMaterial,
   Texture,
   WebGLRenderer,
 } from "three";
@@ -49,24 +52,27 @@ import {
   spreadForPage,
 } from "./pageSelection";
 import {
-  createContactShadowMaterial,
+  createCurlDepthMaterial,
   createCurlMaterial,
   pageMaterial,
-  type ContactShadowMaterial,
+  type CurlDepthMaterial,
   type CurlMaterial,
 } from "./materials";
+import { shadowLightXForTurningSide } from "./shadowDirection";
 
 const PAGE_WIDTH = 1;
 const Z_SPINE = -0.01;
 const Z_RESTING = 0;
 const Z_SHADOW = 0.004;
 const Z_TURNING = 0.014;
+const SHADOW_SEGMENTS_X = 64;
+const SHADOW_SEGMENTS_Y = 48;
 
 export const DEFAULT_TUNING: FlipBookTuning = {
   curlRadius: 0.085,
   minimumLift: 0.018,
   cornerPull: 0.2,
-  shadowOpacity: 0.15,
+  shadowOpacity: 0.42,
   turnDuration: 620,
   gestureSlop: 6,
   releaseThreshold: 0.34,
@@ -185,9 +191,15 @@ export class FlipBookEngine {
   private readonly leftMesh: Mesh<PlaneGeometry, MeshBasicMaterial>;
   private readonly rightMesh: Mesh<PlaneGeometry, MeshBasicMaterial>;
   private readonly curlMaterial: CurlMaterial;
+  private readonly curlDepthMaterial: CurlDepthMaterial;
   private readonly curlMesh: Mesh<PlaneGeometry, CurlMaterial>;
-  private readonly shadowMaterial: ContactShadowMaterial;
-  private readonly shadowMesh: Mesh<PlaneGeometry, ContactShadowMaterial>;
+  private readonly shadowCasterMaterial: MeshBasicMaterial;
+  private readonly shadowCasterMesh: Mesh<PlaneGeometry, MeshBasicMaterial>;
+  private readonly leftShadowMaterial: ShadowMaterial;
+  private readonly rightShadowMaterial: ShadowMaterial;
+  private readonly leftShadowMesh: Mesh<PlaneGeometry, ShadowMaterial>;
+  private readonly rightShadowMesh: Mesh<PlaneGeometry, ShadowMaterial>;
+  private readonly shadowLight: DirectionalLight;
   private readonly spineMaterial: MeshBasicMaterial;
   private readonly spineMesh: Mesh<PlaneGeometry, MeshBasicMaterial>;
   private readonly resizeObserver: ResizeObserver;
@@ -261,6 +273,9 @@ export class FlipBookEngine {
     this.renderer.setClearColor(new Color("#000000"), 0);
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, this.maxPixelRatio));
     this.renderer.outputColorSpace = "srgb";
+    this.renderer.shadowMap.enabled = true;
+    this.renderer.shadowMap.type = PCFSoftShadowMap;
+    this.renderer.shadowMap.autoUpdate = false;
     this.camera.position.set(0, 0, 5);
     this.camera.lookAt(0, 0, 0);
 
@@ -271,18 +286,65 @@ export class FlipBookEngine {
     this.rightMesh.position.z = Z_RESTING;
     this.scene.add(this.leftMesh, this.rightMesh);
 
+    this.leftShadowMaterial = new ShadowMaterial({
+      color: new Color("#07101b"),
+      opacity: this.tuning.shadowOpacity,
+      depthWrite: false,
+      toneMapped: false,
+    });
+    this.rightShadowMaterial = this.leftShadowMaterial.clone();
+    this.leftShadowMesh = new Mesh(pageGeometry.clone(), this.leftShadowMaterial);
+    this.rightShadowMesh = new Mesh(pageGeometry.clone(), this.rightShadowMaterial);
+    this.leftShadowMesh.position.z = Z_SHADOW;
+    this.rightShadowMesh.position.z = Z_SHADOW;
+    this.leftShadowMesh.receiveShadow = true;
+    this.rightShadowMesh.receiveShadow = true;
+    this.leftShadowMesh.visible = false;
+    this.rightShadowMesh.visible = false;
+    this.scene.add(this.leftShadowMesh, this.rightShadowMesh);
+
     const curlGeometry = this.createCurlGeometry();
-    this.curlMaterial = createCurlMaterial(this.paperTexture, this.paperTexture, this.pageHeight);
+    this.curlMaterial = createCurlMaterial(
+      this.paperTexture,
+      this.paperTexture,
+      this.pageHeight,
+    );
+    this.curlDepthMaterial = createCurlDepthMaterial();
     this.curlMesh = new Mesh(curlGeometry, this.curlMaterial);
+    this.curlMesh.frustumCulled = false;
     this.curlMesh.visible = false;
     this.curlMesh.position.z = Z_TURNING;
     this.scene.add(this.curlMesh);
 
-    this.shadowMaterial = createContactShadowMaterial();
-    this.shadowMesh = new Mesh(pageGeometry.clone(), this.shadowMaterial);
-    this.shadowMesh.position.z = Z_SHADOW;
-    this.shadowMesh.visible = false;
-    this.scene.add(this.shadowMesh);
+    this.shadowCasterMaterial = new MeshBasicMaterial({
+      colorWrite: false,
+      depthWrite: false,
+      depthTest: false,
+      toneMapped: false,
+    });
+    this.shadowCasterMesh = new Mesh(
+      this.createCurlGeometry(SHADOW_SEGMENTS_X, SHADOW_SEGMENTS_Y),
+      this.shadowCasterMaterial,
+    );
+    this.shadowCasterMesh.customDepthMaterial = this.curlDepthMaterial;
+    this.shadowCasterMesh.castShadow = true;
+    this.shadowCasterMesh.frustumCulled = false;
+    this.curlMesh.add(this.shadowCasterMesh);
+
+    this.shadowLight = new DirectionalLight(0xffffff, 1);
+    this.shadowLight.position.set(0, 1.1, 3.2);
+    this.shadowLight.target.position.set(0, 0, 0);
+    this.shadowLight.castShadow = true;
+    this.shadowLight.shadow.mapSize.set(512, 512);
+    this.shadowLight.shadow.camera.left = -1.35;
+    this.shadowLight.shadow.camera.right = 1.35;
+    this.shadowLight.shadow.camera.top = 1.15;
+    this.shadowLight.shadow.camera.bottom = -1.15;
+    this.shadowLight.shadow.camera.near = 0.2;
+    this.shadowLight.shadow.camera.far = 7;
+    this.shadowLight.shadow.bias = -0.00035;
+    this.shadowLight.shadow.normalBias = 0.002;
+    this.scene.add(this.shadowLight, this.shadowLight.target);
 
     this.spineMaterial = new MeshBasicMaterial({ color: this.spine.color, toneMapped: false });
     this.spineMesh = new Mesh(new PlaneGeometry(this.gapWorld, this.pageHeight), this.spineMaterial);
@@ -350,7 +412,7 @@ export class FlipBookEngine {
     this.activeTurn = null;
     this.focusSlide = null;
     this.curlMesh.visible = false;
-    this.shadowMesh.visible = false;
+    this.setShadowReceiversVisible(false);
 
     try {
       const nextSource = await createPageSource(sourceDefinition);
@@ -389,12 +451,15 @@ export class FlipBookEngine {
     }
   }
 
-  private createCurlGeometry(): PlaneGeometry {
+  private createCurlGeometry(
+    segmentsX = DEFAULT_SEGMENTS_X,
+    segmentsY = DEFAULT_SEGMENTS_Y,
+  ): PlaneGeometry {
     const geometry = new PlaneGeometry(
       PAGE_WIDTH,
       this.pageHeight,
-      DEFAULT_SEGMENTS_X,
-      DEFAULT_SEGMENTS_Y,
+      segmentsX,
+      segmentsY,
     );
     geometry.translate(PAGE_WIDTH / 2, 0, 0);
     return geometry;
@@ -407,8 +472,10 @@ export class FlipBookEngine {
     };
     replace(this.leftMesh, new PlaneGeometry(PAGE_WIDTH, this.pageHeight));
     replace(this.rightMesh, new PlaneGeometry(PAGE_WIDTH, this.pageHeight));
+    replace(this.leftShadowMesh, new PlaneGeometry(PAGE_WIDTH, this.pageHeight));
+    replace(this.rightShadowMesh, new PlaneGeometry(PAGE_WIDTH, this.pageHeight));
     replace(this.curlMesh, this.createCurlGeometry());
-    replace(this.shadowMesh, new PlaneGeometry(PAGE_WIDTH, this.pageHeight));
+    replace(this.shadowCasterMesh, this.createCurlGeometry(SHADOW_SEGMENTS_X, SHADOW_SEGMENTS_Y));
     replace(this.spineMesh, new PlaneGeometry(this.gapWorld, this.pageHeight));
     this.curlMaterial.uniforms.uPageHeight.value = this.pageHeight;
   }
@@ -423,8 +490,7 @@ export class FlipBookEngine {
     this.renderer.setSize(width, height, false);
     const approximateViewWidth = this.mobile ? 1 + this.tuning.mobilePeek : 2.12;
     this.gapWorld = Math.max(0.002, (this.spine.widthPx / width) * approximateViewWidth);
-    this.leftMesh.position.x = pageCenter("left", this.gapWorld);
-    this.rightMesh.position.x = pageCenter("right", this.gapWorld);
+    this.positionRestingPages();
     this.spineMesh.geometry.dispose();
     this.spineMesh.geometry = new PlaneGeometry(this.gapWorld, this.pageHeight);
     if (wasMobile !== this.mobile) {
@@ -539,6 +605,25 @@ export class FlipBookEngine {
   private positionRestingPages(): void {
     this.leftMesh.position.x = pageCenter("left", this.gapWorld);
     this.rightMesh.position.x = pageCenter("right", this.gapWorld);
+    this.leftShadowMesh.position.x = this.leftMesh.position.x;
+    this.rightShadowMesh.position.x = this.rightMesh.position.x;
+  }
+
+  private setShadowReceiversVisible(visible: boolean): void {
+    if (!visible || !this.activeTurn || this.tuning.shadowOpacity <= 0.001) {
+      this.leftShadowMesh.visible = false;
+      this.rightShadowMesh.visible = false;
+      this.shadowCasterMesh.visible = false;
+      return;
+    }
+    this.shadowCasterMesh.visible = true;
+    this.leftShadowMaterial.opacity = this.tuning.shadowOpacity;
+    this.rightShadowMaterial.opacity = this.tuning.shadowOpacity;
+    // Never choose a receiver in application code. A real shadow can cross the
+    // gutter at any drag angle, so every visible page beneath the sheet must
+    // receive it and the light's depth map alone decides where it lands.
+    this.leftShadowMesh.visible = this.leftMesh.visible;
+    this.rightShadowMesh.visible = this.rightMesh.visible;
   }
 
   private async assignPage(
@@ -703,17 +788,16 @@ export class FlipBookEngine {
     this.activeTurn = turn;
     this.curlMaterial.uniforms.uFrontMap.value = front;
     this.curlMaterial.uniforms.uBackMap.value = back;
-    this.curlMaterial.uniforms.uSideSign.value = faces.turningSide === "right" ? 1 : -1;
+    const sideSign = faces.turningSide === "right" ? 1 : -1;
+    this.curlMaterial.uniforms.uSideSign.value = sideSign;
+    this.curlDepthMaterial.curlUniforms.uSideSign.value = sideSign;
+    this.shadowLight.position.x = shadowLightXForTurningSide(faces.turningSide);
     this.curlMaterial.uniforms.uMirrored.value = faces.turningSide === "left" ? 1 : 0;
     this.curlMesh.position.x = faces.turningSide === "right" ? this.gapWorld / 2 : -this.gapWorld / 2;
     this.curlMesh.visible = true;
 
-    this.shadowMesh.position.x = pageCenter(faces.receivingSide, this.gapWorld);
-    this.shadowMaterial.uniforms.uFromHinge.value = faces.receivingSide === "right" ? 1 : -1;
-    this.shadowMaterial.uniforms.uOpacity.value = this.tuning.shadowOpacity;
-    this.shadowMesh.visible = !hover;
-
     if (!hover) void this.showSpread(faces.underlay, false);
+    this.setShadowReceiversVisible(true);
     this.updatePins();
     this.setTurnProgress(initialProgress, true);
     return turn;
@@ -724,8 +808,8 @@ export class FlipBookEngine {
     if (!turn || turn.committed) return;
     turn.committed = true;
     turn.hover = false;
-    this.shadowMesh.visible = true;
     void this.showSpread(turn.faces.underlay, false);
+    this.setShadowReceiversVisible(true);
     this.updatePins();
     this.updateCamera();
     this.renderNow();
@@ -750,7 +834,12 @@ export class FlipBookEngine {
     this.curlMaterial.uniforms.uNormal.value.set(curlState.normal.x, curlState.normal.y);
     this.curlMaterial.uniforms.uActualRadius.value = curlState.radius;
     this.curlMaterial.uniforms.uArcLength.value = curlState.arcLength;
-    this.shadowMaterial.uniforms.uProgress.value = progress;
+    this.curlDepthMaterial.curlUniforms.uProgress.value = progress;
+    this.curlDepthMaterial.curlUniforms.uAxis.value.set(curlState.axis.x, curlState.axis.y);
+    this.curlDepthMaterial.curlUniforms.uNormal.value.set(curlState.normal.x, curlState.normal.y);
+    this.curlDepthMaterial.curlUniforms.uActualRadius.value = curlState.radius;
+    this.curlDepthMaterial.curlUniforms.uArcLength.value = curlState.arcLength;
+    this.setShadowReceiversVisible(true);
     this.updateCamera();
     if (immediate) this.renderNow();
     else this.requestRender();
@@ -800,7 +889,7 @@ export class FlipBookEngine {
     if (!turn) return;
     this.activeTurn = null;
     this.curlMesh.visible = false;
-    this.shadowMesh.visible = false;
+    this.setShadowReceiversVisible(false);
     if (completed) this.page = turn.targetPage;
     this.activeCase = null;
     void this.showStableSpread(false);
@@ -904,14 +993,14 @@ export class FlipBookEngine {
       curlRadius: Math.min(0.22, Math.max(0.025, values.curlRadius ?? this.tuning.curlRadius)),
       minimumLift: Math.min(0.08, Math.max(0, values.minimumLift ?? this.tuning.minimumLift)),
       cornerPull: Math.min(0.45, Math.max(0.02, values.cornerPull ?? this.tuning.cornerPull)),
-      shadowOpacity: Math.min(0.35, Math.max(0, values.shadowOpacity ?? this.tuning.shadowOpacity)),
+      shadowOpacity: Math.min(0.8, Math.max(0, values.shadowOpacity ?? this.tuning.shadowOpacity)),
       turnDuration: Math.min(1600, Math.max(180, values.turnDuration ?? this.tuning.turnDuration)),
       gestureSlop: Math.min(24, Math.max(2, values.gestureSlop ?? this.tuning.gestureSlop)),
       releaseThreshold: Math.min(0.8, Math.max(0.15, values.releaseThreshold ?? this.tuning.releaseThreshold)),
       mobilePeek: Math.min(0.2, Math.max(0.02, values.mobilePeek ?? this.tuning.mobilePeek)),
       qualityScale: Math.min(2, Math.max(0.6, values.qualityScale ?? this.tuning.qualityScale)),
     };
-    this.shadowMaterial.uniforms.uOpacity.value = this.tuning.shadowOpacity;
+    this.setShadowReceiversVisible(Boolean(this.activeTurn));
     if (this.activeTurn) this.setTurnProgress(this.activeTurn.progress, true);
     this.resize();
     this.scheduleSharpRefresh();
@@ -1318,7 +1407,7 @@ export class FlipBookEngine {
     if (this.activeTurn) {
       this.activeTurn = null;
       this.curlMesh.visible = false;
-      this.shadowMesh.visible = false;
+      this.setShadowReceiversVisible(false);
       void this.showStableSpread(false);
       this.updateCamera();
       this.requestRender();
@@ -1377,6 +1466,8 @@ export class FlipBookEngine {
       cancelAnimationFrame(this.renderFrame);
       this.renderFrame = null;
     }
+    this.renderer.shadowMap.needsUpdate = this.curlMesh.visible
+      && (this.leftShadowMesh.visible || this.rightShadowMesh.visible);
     this.renderer.render(this.scene, this.camera);
     this.renderCount += 1;
     this.renderTimes.push(performance.now());
@@ -1409,13 +1500,19 @@ export class FlipBookEngine {
     this.source?.dispose();
     this.leftMesh.geometry.dispose();
     this.rightMesh.geometry.dispose();
+    this.leftShadowMesh.geometry.dispose();
+    this.rightShadowMesh.geometry.dispose();
     this.curlMesh.geometry.dispose();
-    this.shadowMesh.geometry.dispose();
+    this.shadowCasterMesh.geometry.dispose();
     this.spineMesh.geometry.dispose();
     this.leftMaterial.dispose();
     this.rightMaterial.dispose();
     this.curlMaterial.dispose();
-    this.shadowMaterial.dispose();
+    this.curlDepthMaterial.dispose();
+    this.shadowCasterMaterial.dispose();
+    this.leftShadowMaterial.dispose();
+    this.rightShadowMaterial.dispose();
+    this.shadowLight.shadow.dispose();
     this.spineMaterial.dispose();
     this.paperTexture.dispose();
     this.renderer.dispose();

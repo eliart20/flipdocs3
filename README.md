@@ -2,6 +2,8 @@
 
 A small React flipbook for PDF documents and page images. React owns lifecycle and controls; one direct Three.js `WebGLRenderer` owns the flat pages and the single deforming page-turn mesh.
 
+The turning sheet casts a soft real-time shadow map onto the flat pages. Its custom depth pass uses the same deformation uniforms as the visible curl, so the shadow follows corner and diagonal drags.
+
 ## Install
 
 ```bash
