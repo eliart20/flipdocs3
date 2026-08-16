@@ -64,15 +64,17 @@ class ImagePageSource implements PageSource {
     return new ImagePageSource(pages, first);
   }
 
-  async render(pageIndex: number, targetHeight: number): Promise<PageSurface> {
+  async render(pageIndex: number, targetHeight: number, signal?: AbortSignal): Promise<PageSurface> {
     const input = this.pages[pageIndex];
     if (input === undefined) throw new RangeError(`Page ${pageIndex + 1} is out of range.`);
+    if (signal?.aborted) throw new DOMException("The page render was cancelled.", "AbortError");
     let pending = this.loaded.get(pageIndex);
     if (!pending) {
       pending = loadImage(input);
       this.loaded.set(pageIndex, pending);
     }
     const loaded = await pending;
+    if (signal?.aborted) throw new DOMException("The page render was cancelled.", "AbortError");
     const height = Math.max(1, Math.min(loaded.height, Math.round(targetHeight)));
     const width = Math.max(1, Math.round(height * (loaded.width / loaded.height)));
     const canvas = document.createElement("canvas");
@@ -85,6 +87,11 @@ class ImagePageSource implements PageSource {
     context.imageSmoothingEnabled = true;
     context.imageSmoothingQuality = "high";
     context.drawImage(loaded.image, 0, 0, width, height);
+    if (signal?.aborted) {
+      canvas.width = 1;
+      canvas.height = 1;
+      throw new DOMException("The page render was cancelled.", "AbortError");
+    }
     return {
       image: canvas,
       width,

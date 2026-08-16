@@ -74,6 +74,92 @@ describe("developable curl geometry", () => {
     }
   });
 
+  it("droops only the corner opposite the grab while preserving the grabbed point", () => {
+    const rigid: CurlPose = {
+      progress: 0.5,
+      radius: 0.085,
+      minimumLift: 0.018,
+      cornerSag: 0,
+      side: "right",
+      grabX: 1,
+      grabY: 1,
+      targetY: 0.72,
+      verticalInfluence: 1,
+    };
+    const flexible = { ...rigid, cornerSag: 1 };
+    const rigidOpposite = deformPoint(1, -height / 2, width, height, rigid);
+    const flexibleOpposite = deformPoint(1, -height / 2, width, height, flexible);
+    const rigidGrab = mappedGrabPoint(width, height, rigid);
+    const flexibleGrab = mappedGrabPoint(width, height, flexible);
+
+    expect(flexibleOpposite.x).toBeCloseTo(rigidOpposite.x, 9);
+    expect(flexibleOpposite.y).toBeCloseTo(rigidOpposite.y, 9);
+    expect(flexibleOpposite.z).toBeLessThan(rigidOpposite.z - width * 0.02);
+    expect(flexibleOpposite.z).toBeGreaterThanOrEqual(0);
+    expect(flexibleGrab.x).toBeCloseTo(rigidGrab.x, 9);
+    expect(flexibleGrab.y).toBeCloseTo(rigidGrab.y, 9);
+    expect(flexibleGrab.z).toBeCloseTo(rigidGrab.z, 9);
+  });
+
+  it("keeps maximum local stretch below one percent with full corner sag", () => {
+    const ratios = edgeLengthRatios(sampleGeometry(width, height, {
+      progress: 0.5,
+      radius: 0.085,
+      minimumLift: 0.018,
+      cornerSag: 1,
+      side: "right",
+      grabX: 1,
+      grabY: 0.96,
+      targetY: 0.68,
+      verticalInfluence: 1,
+    }, 160, 112), width, height);
+    expect(Math.max(...ratios)).toBeLessThanOrEqual(1.01);
+  });
+
+  it("sags the top corner when the bottom corner is grabbed", () => {
+    const rigid: CurlPose = {
+      progress: 0.58,
+      radius: 0.085,
+      minimumLift: 0.018,
+      cornerSag: 0,
+      side: "right",
+      grabX: 1,
+      grabY: 0.04,
+      targetY: 0.04,
+      verticalInfluence: 1,
+    };
+    const flexible = { ...rigid, cornerSag: 1 };
+    const rigidTop = deformPoint(width, height / 2, width, height, rigid);
+    const flexibleTop = deformPoint(width, height / 2, width, height, flexible);
+    const rigidGrab = mappedGrabPoint(width, height, rigid);
+    const flexibleGrab = mappedGrabPoint(width, height, flexible);
+
+    expect(flexibleTop.x).toBeCloseTo(rigidTop.x, 9);
+    expect(flexibleTop.y).toBeCloseTo(rigidTop.y, 9);
+    expect(flexibleTop.z).toBeLessThan(rigidTop.z - width * 0.02);
+    expect(flexibleGrab.x).toBeCloseTo(rigidGrab.x, 9);
+    expect(flexibleGrab.y).toBeCloseTo(rigidGrab.y, 9);
+    expect(flexibleGrab.z).toBeCloseTo(rigidGrab.z, 9);
+  });
+
+  it("removes the Z-axis sag exactly when cornerSag is zero", () => {
+    const pose: CurlPose = {
+      progress: 0.5,
+      radius: 0.085,
+      minimumLift: 0.018,
+      cornerSag: 0,
+      side: "right",
+      grabX: 1,
+      grabY: 0.96,
+      targetY: 0.68,
+      verticalInfluence: 1,
+    };
+    const state = solveCurlState(width, height, pose);
+    expect(state.cornerSagDepth).toBe(0);
+    expect(deformPoint(width, -height / 2, width, height, pose))
+      .toEqual(deformPoint(width, -height / 2, width, height, { ...pose, cornerSag: undefined }));
+  });
+
   it("mirrors forward and backward geometry exactly", () => {
     const base: Omit<CurlPose, "side"> = {
       progress: 0.47,

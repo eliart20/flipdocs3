@@ -7,6 +7,7 @@ const regressionPdfRoot = "C:/Users/Artscroll/Documents/flipdocs/public/pdfs";
 const regressionPdfs = [
   "002 MS Stone Shemos (F-32) SMS2HI.pdf",
   "025 Niddah.pdf",
+  "025 Niddah (20pp full).pdf",
   "11b - Five Megilos (b).pdf",
   "257 HT Chullin (10) -257- 7x10-2up.pdf",
   "Bais Yaakov Pomona - Final Yearbook combined.pdf",
@@ -62,8 +63,105 @@ function regressionPdfPlugin() {
   };
 }
 
+/**
+ * tunn3l's HTTP endpoint carries ordinary requests reliably but currently
+ * rejects Vite's WebSocket upgrade. A tiny no-cache revision poll gives the
+ * public demo dependable full-page hot reload without a second transport.
+ */
+function tunnelReloadPlugin() {
+  let revision = `${Date.now()}-0`;
+  let sequence = 0;
+  return {
+    name: "flipdocs-tunnel-reload",
+    apply: "serve" as const,
+    configureServer(server: import("vite").ViteDevServer) {
+      // Vite injects /@vite/client even with server.hmr=false because CSS
+      // modules use its style helpers. Serve only those helpers here so the
+      // browser does not attempt the WebSocket that tunn3l rejects.
+      server.middlewares.use((request, response, next) => {
+        if ((request.url ?? "").split("?")[0] !== "/@vite/client") return next();
+        response.statusCode = 200;
+        response.setHeader("Cache-Control", "no-store");
+        response.setHeader("Content-Type", "text/javascript; charset=utf-8");
+        response.end(`
+          const styles = new Map();
+          export function createHotContext() {
+            return {
+              accept() {}, acceptExports() {}, dispose() {}, prune() {}, decline() {},
+              invalidate() { window.location.reload(); }, on() {}, off() {}, send() {},
+            };
+          }
+          export function updateStyle(id, content) {
+            let style = styles.get(id);
+            if (!style) {
+              style = document.createElement('style');
+              style.setAttribute('data-vite-dev-id', id);
+              document.head.appendChild(style);
+              styles.set(id, style);
+            }
+            style.textContent = content;
+          }
+          export function removeStyle(id) {
+            styles.get(id)?.remove();
+            styles.delete(id);
+          }
+          export function injectQuery(url, query) {
+            const hashIndex = url.indexOf('#');
+            const hash = hashIndex < 0 ? '' : url.slice(hashIndex);
+            const withoutHash = hashIndex < 0 ? url : url.slice(0, hashIndex);
+            return withoutHash + (withoutHash.includes('?') ? '&' : '?') + query + hash;
+          }
+          export class ErrorOverlay extends (globalThis.HTMLElement ?? class {}) {}
+        `);
+      });
+      const updateRevision = (_event: string, path: string) => {
+        const normalized = path.replaceAll("\\", "/");
+        if (
+          normalized.includes("/node_modules/")
+          || normalized.includes("/.git/")
+          || normalized.includes("/.codex-remote-attachments/")
+          || normalized.includes("/dist/")
+        ) return;
+        revision = `${Date.now()}-${sequence += 1}`;
+      };
+      server.watcher.on("all", updateRevision);
+      server.middlewares.use("/__flipdocs_revision", (_request, response) => {
+        response.statusCode = 200;
+        response.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+        response.setHeader("Content-Type", "text/plain; charset=utf-8");
+        response.end(revision);
+      });
+    },
+    transformIndexHtml() {
+      return [{
+        tag: "script",
+        attrs: { type: "module" },
+        injectTo: "body" as const,
+        children: `
+          let flipdocsRevision;
+          const pollFlipdocsRevision = async () => {
+            try {
+              const response = await fetch('/__flipdocs_revision', { cache: 'no-store' });
+              const nextRevision = await response.text();
+              if (flipdocsRevision === undefined) flipdocsRevision = nextRevision;
+              else if (nextRevision !== flipdocsRevision) window.location.reload();
+            } catch {
+              // The next poll recovers automatically when the tunnel reconnects.
+            }
+          };
+          pollFlipdocsRevision();
+          window.setInterval(pollFlipdocsRevision, 650);
+        `,
+      }];
+    },
+  };
+}
+
 export default defineConfig({
-  plugins: [react(), regressionPdfPlugin()],
+  plugins: [react(), regressionPdfPlugin(), tunnelReloadPlugin()],
+  worker: {
+    format: "es",
+  },
   build: {
     copyPublicDir: false,
     lib: {
@@ -85,9 +183,6 @@ export default defineConfig({
       usePolling: true,
       interval: 150,
     },
-    hmr: {
-      protocol: "wss",
-      clientPort: 443,
-    },
+    hmr: false,
   },
 });

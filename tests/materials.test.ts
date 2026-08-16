@@ -1,26 +1,30 @@
-import { DoubleSide, RGBADepthPacking } from "three";
+import { DoubleSide, Texture } from "three";
 import { describe, expect, it } from "vitest";
-import { createCurlDepthMaterial } from "../src/core/materials";
+import { createCurlMaterial, createFakeShadowMaterial } from "../src/core/materials";
 
-describe("real curl shadow depth pass", () => {
-  it("injects the production curl deformation into the RGBA shadow depth shader", () => {
-    const material = createCurlDepthMaterial();
-    const shader = {
-      uniforms: {},
-      vertexShader: "#include <common>\nvoid main() {\n#include <begin_vertex>\n}",
-      fragmentShader: "",
-    };
+describe("analytic curl shadows", () => {
+  it("uses the visible curl shader for Z sag and outer-sheet shading", () => {
+    const texture = new Texture();
+    const material = createCurlMaterial(texture, texture, 4 / 3);
 
-    material.onBeforeCompile(shader as never, {} as never);
-
-    expect(material.depthPacking).toBe(RGBADepthPacking);
     expect(material.side).toBe(DoubleSide);
-    expect(shader.vertexShader).toContain("curlDepthPosition");
-    expect(shader.vertexShader).toContain("vec3 transformed = curlDepthPosition(position.x, position.y);");
-    expect(shader.vertexShader).not.toContain("#include <begin_vertex>");
-    expect(shader.uniforms).toMatchObject(material.curlUniforms);
-    expect(material.customProgramCacheKey()).toBe("flipdocs-curl-depth-v1");
+    expect(material.uniforms.uCornerSagDepth.value).toBe(0);
+    expect(material.uniforms.uShadowOpacity.value).toBeGreaterThan(0);
+    expect(material.vertexShader).toContain("mappedZ - sagDrop");
+    expect(material.fragmentShader).toContain("fakeOuterShadow");
+    material.dispose();
+    texture.dispose();
+  });
 
+  it("draws a lightweight fold-aligned contact band without a shadow map", () => {
+    const material = createFakeShadowMaterial(0.42);
+
+    expect(material.transparent).toBe(true);
+    expect(material.depthWrite).toBe(false);
+    expect(material.uniforms.uOpacity.value).toBe(0.42);
+    expect(material.fragmentShader).toContain("foldDistance");
+    expect(material.fragmentShader).toContain("smoothstep");
+    expect(material.fragmentShader).not.toContain("shadowMap");
     material.dispose();
   });
 });

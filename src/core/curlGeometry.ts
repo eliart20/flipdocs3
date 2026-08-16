@@ -3,6 +3,8 @@ import type { PageSide } from "../types";
 export interface CurlPose {
   progress: number;
   radius: number;
+  /** 0 keeps both outer corners level; 1 lets the corner opposite the grab droop. */
+  cornerSag?: number;
   /** Minimum fold height. It fades to zero only at the two flat endpoints. */
   minimumLift?: number;
   side: PageSide;
@@ -32,6 +34,10 @@ export interface CurlState {
   tangent: Point2;
   radius: number;
   arcLength: number;
+  pageWidth: number;
+  oppositeSpan: number;
+  /** Maximum Z-depth drop at the diagonally opposite outer corner. */
+  cornerSagDepth: number;
   origin: Point2;
   requestedTarget: Point2;
   constrainedTarget: Point2;
@@ -43,6 +49,7 @@ export interface CurlState {
 // collapse into a single chord on mobile GPUs.
 export const DEFAULT_SEGMENTS_X = 160;
 export const DEFAULT_SEGMENTS_Y = 112;
+const CORNER_SAG_DEPTH_SCALE = 0.03;
 
 export function clamp01(value: number): number {
   return Math.min(1, Math.max(0, value));
@@ -167,7 +174,6 @@ export function solveCurlState(
     y: origin.y - candidate.normal.y * distanceToAxis,
   };
   const tangent = { x: -candidate.normal.y, y: candidate.normal.x };
-
   return {
     progress,
     axis,
@@ -175,6 +181,15 @@ export function solveCurlState(
     tangent,
     radius,
     arcLength,
+    pageWidth,
+    oppositeSpan: Math.max(
+      pageHeight * 0.08,
+      origin.y >= 0 ? origin.y + pageHeight / 2 : pageHeight / 2 - origin.y,
+    ),
+    cornerSagDepth: clamp01(pose.cornerSag ?? 0)
+      * pageWidth
+      * CORNER_SAG_DEPTH_SCALE
+      * envelope,
     origin,
     requestedTarget,
     constrainedTarget: candidate.target,
@@ -195,6 +210,15 @@ export function deformPointWithState(
     return { x: side === "right" ? -materialX : materialX, y: materialY, z: 0 };
   }
 
+  const oppositeSign = state.origin.y >= 0 ? -1 : 1;
+  const rawOppositeDistance = ((materialY - state.origin.y) * oppositeSign)
+    / state.oppositeSpan;
+  const oppositeDistance = clamp01(rawOppositeDistance);
+  const outerWeight = clamp01(materialX / state.pageWidth);
+  const oppositeWeight = oppositeDistance * oppositeDistance * (3 - 2 * oppositeDistance);
+  const sagDrop = rawOppositeDistance > 0
+    ? state.cornerSagDepth * oppositeWeight * outerWeight
+    : 0;
   const relativeX = materialX - state.axis.x;
   const relativeY = materialY - state.axis.y;
   const normalDistance = relativeX * state.normal.x + relativeY * state.normal.y;
@@ -209,9 +233,11 @@ export function deformPointWithState(
     mappedNormal = -(normalDistance - state.arcLength);
     z = 2 * state.radius;
   }
-  const x = state.axis.x + state.normal.x * mappedNormal + state.tangent.x * tangentDistance;
-  const y = state.axis.y + state.normal.y * mappedNormal + state.tangent.y * tangentDistance;
-  return { x: side === "right" ? x : -x, y, z: Math.max(0, z) };
+  const x = state.axis.x + state.normal.x * mappedNormal
+    + state.tangent.x * tangentDistance;
+  const y = state.axis.y + state.normal.y * mappedNormal
+    + state.tangent.y * tangentDistance;
+  return { x: side === "right" ? x : -x, y, z: Math.max(0, z - sagDrop) };
 }
 
 export function deformPoint(
@@ -300,6 +326,9 @@ export const curlVertexShader = /* glsl */ `
   uniform vec2 uNormal;
   uniform float uActualRadius;
   uniform float uArcLength;
+  uniform float uGrabMaterialY;
+  uniform float uOppositeSpan;
+  uniform float uCornerSagDepth;
   varying vec2 vPageUv;
   varying vec3 vCurlNormal;
   varying float vFoldAngle;
@@ -313,6 +342,14 @@ export const curlVertexShader = /* glsl */ `
       foldAngle = 3.14159265359;
       return vec3(-uSideSign * materialX, materialY, 0.0);
     }
+    float oppositeSign = uGrabMaterialY >= 0.0 ? -1.0 : 1.0;
+    float rawOppositeDistance = ((materialY - uGrabMaterialY) * oppositeSign)
+      / max(0.000001, uOppositeSpan);
+    float oppositeDistance = clamp(rawOppositeDistance, 0.0, 1.0);
+    float outerWeight = clamp(materialX / uPageWidth, 0.0, 1.0);
+    float activeOpposite = step(0.0000001, rawOppositeDistance);
+    float oppositeWeight = oppositeDistance * oppositeDistance * (3.0 - 2.0 * oppositeDistance);
+    float sagDrop = uCornerSagDepth * oppositeWeight * outerWeight * activeOpposite;
     vec2 tangent = vec2(-uNormal.y, uNormal.x);
     vec2 relative = vec2(materialX, materialY) - uAxis;
     float normalDistance = dot(relative, uNormal);
@@ -331,7 +368,7 @@ export const curlVertexShader = /* glsl */ `
       foldAngle = 0.0;
     }
     vec2 mapped = uAxis + uNormal * mappedNormal + tangent * tangentDistance;
-    return vec3(uSideSign * mapped.x, mapped.y, max(0.0, mappedZ));
+    return vec3(uSideSign * mapped.x, mapped.y, max(0.0, mappedZ - sagDrop));
   }
 
   void main() {
@@ -356,6 +393,7 @@ export const curlFragmentShader = /* glsl */ `
   uniform sampler2D uBackMap;
   uniform float uProgress;
   uniform float uMirrored;
+  uniform float uShadowOpacity;
   varying vec2 vPageUv;
   varying vec3 vCurlNormal;
   varying float vFoldAngle;
@@ -371,6 +409,9 @@ export const curlFragmentShader = /* glsl */ `
     float fold = pow(abs(sin(vFoldAngle)), 1.4);
     float facing = 0.93 + 0.07 * abs(normal.z);
     float shade = mix(1.0, facing * (1.0 - 0.08 * fold), envelope);
+    float outerCurl = smoothstep(0.48, 1.0, vPageUv.x);
+    float fakeOuterShadow = outerCurl * fold * envelope * uShadowOpacity;
+    shade *= 1.0 - 0.24 * fakeOuterShadow;
     gl_FragColor = vec4(paper.rgb * shade, paper.a);
     #include <tonemapping_fragment>
     #include <colorspace_fragment>

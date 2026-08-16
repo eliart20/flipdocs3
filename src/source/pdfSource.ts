@@ -1,12 +1,11 @@
 import type {
-  PDFDataRangeTransport,
   PDFDocumentLoadingTask,
   PDFDocumentProxy,
 } from "pdfjs-dist";
 import type { PageSource, PageSurface } from "./PageSource";
+import { openPdfDocument, type MessageFromPdfWorker, type MessageToPdfWorker } from "./pdfCommon";
 
 const WORKER_FILE = "pdf.worker.min.mjs";
-const RANGE_CHUNK_SIZE = 256 * 1024;
 
 function packagedWorkerUrl(): string {
   if (import.meta.env.DEV && typeof window !== "undefined") {
@@ -15,101 +14,142 @@ function packagedWorkerUrl(): string {
   return new URL("./pdf.worker.min.mjs", import.meta.url).href;
 }
 
-function fileName(input: string | Blob): string {
-  if (input instanceof Blob && "name" in input && typeof input.name === "string") return input.name;
-  if (typeof input === "string") {
-    try {
-      return decodeURIComponent(new URL(input, document.baseURI).pathname.split("/").at(-1) ?? "document.pdf");
-    } catch {
-      return "document.pdf";
-    }
-  }
-  return "document.pdf";
+/** Rasterizing off the main thread needs both a module worker and OffscreenCanvas 2D. */
+function supportsRasterWorker(): boolean {
+  return typeof Worker === "function"
+    && typeof OffscreenCanvas === "function"
+    && typeof OffscreenCanvas.prototype.getContext === "function";
 }
 
-function blobRangeTransport(
-  pdfjs: typeof import("pdfjs-dist"),
-  blob: Blob,
-): PDFDataRangeTransport {
-  class BlobTransport extends pdfjs.PDFDataRangeTransport {
-    private stopped = false;
-
-    constructor() {
-      super(blob.size, null, true, fileName(blob));
-    }
-
-    requestDataRange(begin: number, end: number): void {
-      void blob.slice(begin, Math.min(end, blob.size)).arrayBuffer().then((buffer) => {
-        if (!this.stopped) this.onDataRange(begin, new Uint8Array(buffer));
-      }).catch(() => {
-        if (!this.stopped) this.onDataRange(begin, new Uint8Array());
-      });
-    }
-
-    abort(): void {
-      this.stopped = true;
-    }
-  }
-
-  return new BlobTransport();
+interface PendingWorkerRender {
+  resolve: (surface: PageSurface) => void;
+  reject: (error: unknown) => void;
+  detachAbort: () => void;
 }
 
-async function urlRangeTransport(
-  pdfjs: typeof import("pdfjs-dist"),
-  url: string,
-): Promise<PDFDataRangeTransport | undefined> {
-  let probe: Response;
-  try {
-    probe = await fetch(url, { headers: { Range: "bytes=0-0" } });
-  } catch {
-    return undefined;
+class WorkerPdfPageSource implements PageSource {
+  private sequence = 0;
+  private readonly pending = new Map<number, PendingWorkerRender>();
+  private disposed = false;
+
+  private constructor(
+    private readonly worker: Worker,
+    readonly pageCount: number,
+    readonly pageAspect: number,
+  ) {
+    this.worker.onmessage = (event: MessageEvent<MessageFromPdfWorker>) => this.onMessage(event.data);
+    this.worker.onerror = () => this.failAll(new Error("The PDF raster worker crashed."));
   }
-  const match = /^bytes\s+0-0\/(\d+)$/i.exec(probe.headers.get("Content-Range") ?? "");
-  if (probe.status !== 206 || !match) {
-    await probe.body?.cancel().catch(() => undefined);
-    return undefined;
-  }
-  const total = Number(match[1]);
-  const initial = new Uint8Array(await probe.arrayBuffer());
-  if (!Number.isSafeInteger(total) || total <= 1 || initial.byteLength !== 1) return undefined;
 
-  class UrlTransport extends pdfjs.PDFDataRangeTransport {
-    private stopped = false;
-    private readonly controllers = new Set<AbortController>();
-
-    constructor() {
-      super(total, initial, true, fileName(url));
-    }
-
-    requestDataRange(begin: number, end: number): void {
-      const boundedEnd = Math.min(total, end);
-      const controller = new AbortController();
-      this.controllers.add(controller);
-      void fetch(url, {
-        headers: { Range: `bytes=${begin}-${boundedEnd - 1}` },
-        signal: controller.signal,
-      }).then(async (response) => {
-        if (response.status !== 206) throw new Error(`Expected HTTP 206, received ${response.status}.`);
-        const expectedRange = `bytes ${begin}-${boundedEnd - 1}/${total}`;
-        if (response.headers.get("Content-Range") !== expectedRange) {
-          throw new Error("The PDF server returned an invalid byte range.");
+  static create(src: string | Blob, timeoutMs = 120_000): Promise<WorkerPdfPageSource> {
+    const worker = new Worker(new URL("./pdfRasterWorker.ts", import.meta.url), { type: "module" });
+    return new Promise<WorkerPdfPageSource>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        worker.terminate();
+        reject(new Error("The PDF raster worker did not finish loading the document."));
+      }, timeoutMs);
+      worker.onerror = (event) => {
+        clearTimeout(timeout);
+        worker.terminate();
+        reject(new Error(event.message || "The PDF raster worker failed to start."));
+      };
+      worker.onmessage = (event: MessageEvent<MessageFromPdfWorker>) => {
+        const message = event.data;
+        if (message.type === "ready") {
+          clearTimeout(timeout);
+          resolve(new WorkerPdfPageSource(worker, message.pageCount, message.pageAspect));
+        } else if (message.type === "init-error") {
+          clearTimeout(timeout);
+          worker.terminate();
+          reject(new Error(message.message));
         }
-        const bytes = new Uint8Array(await response.arrayBuffer());
-        if (bytes.byteLength !== boundedEnd - begin) throw new Error("The PDF byte range was incomplete.");
-        if (!this.stopped) this.onDataRange(begin, bytes);
-      }).catch(() => {
-        if (!this.stopped) this.onDataRange(begin, new Uint8Array());
-      }).finally(() => this.controllers.delete(controller));
-    }
+      };
+      const init: MessageToPdfWorker = {
+        type: "init",
+        src,
+        baseUrl: document.baseURI,
+        parserWorkerUrl: packagedWorkerUrl(),
+      };
+      worker.postMessage(init);
+    });
+  }
 
-    abort(): void {
-      this.stopped = true;
-      for (const controller of this.controllers) controller.abort();
-      this.controllers.clear();
+  render(pageIndex: number, targetHeight: number, signal?: AbortSignal): Promise<PageSurface> {
+    if (pageIndex < 0 || pageIndex >= this.pageCount) {
+      return Promise.reject(new RangeError(`Page ${pageIndex + 1} is out of range.`));
+    }
+    if (this.disposed) {
+      return Promise.reject(new DOMException("The PDF source has been disposed.", "AbortError"));
+    }
+    if (signal?.aborted) {
+      return Promise.reject(new DOMException("The page render was cancelled.", "AbortError"));
+    }
+    const id = ++this.sequence;
+    return new Promise<PageSurface>((resolve, reject) => {
+      const cancel = () => this.post({ type: "cancel", id });
+      signal?.addEventListener("abort", cancel, { once: true });
+      this.pending.set(id, {
+        resolve,
+        reject,
+        detachAbort: () => signal?.removeEventListener("abort", cancel),
+      });
+      this.post({ type: "render", id, pageIndex, targetHeight: Math.max(1, Math.round(targetHeight)) });
+    });
+  }
+
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.post({ type: "destroy" });
+    this.failAll(new DOMException("The PDF source has been disposed.", "AbortError"));
+    // Give the worker a moment to destroy the loading task before termination.
+    setTimeout(() => this.worker.terminate(), 1000);
+  }
+
+  private post(message: MessageToPdfWorker): void {
+    this.worker.postMessage(message);
+  }
+
+  private onMessage(message: MessageFromPdfWorker): void {
+    if (message.type === "rendered") {
+      const pending = this.takePending(message.id);
+      if (!pending) {
+        message.bitmap.close();
+        return;
+      }
+      const bitmap = message.bitmap;
+      pending.resolve({
+        image: bitmap,
+        width: message.width,
+        height: message.height,
+        dispose: () => bitmap.close(),
+      });
+      return;
+    }
+    if (message.type === "render-error") {
+      const pending = this.takePending(message.id);
+      pending?.reject(message.name === "AbortError"
+        ? new DOMException("The page render was cancelled.", "AbortError")
+        : new Error(message.message));
     }
   }
 
-  return new UrlTransport();
+  private takePending(id: number): PendingWorkerRender | undefined {
+    const pending = this.pending.get(id);
+    if (!pending) return undefined;
+    this.pending.delete(id);
+    pending.detachAbort();
+    return pending;
+  }
+
+  private failAll(error: unknown): void {
+    const pending = [...this.pending.values()];
+    this.pending.clear();
+    for (const entry of pending) {
+      entry.detachAbort();
+      entry.reject(error);
+    }
+  }
 }
 
 class PdfPageSource implements PageSource {
@@ -125,11 +165,16 @@ class PdfPageSource implements PageSource {
     this.pageAspect = pageAspect;
   }
 
-  async render(pageIndex: number, targetHeight: number): Promise<PageSurface> {
+  async render(pageIndex: number, targetHeight: number, signal?: AbortSignal): Promise<PageSurface> {
     if (pageIndex < 0 || pageIndex >= this.pageCount) {
       throw new RangeError(`Page ${pageIndex + 1} is out of range.`);
     }
+    if (signal?.aborted) throw new DOMException("The page render was cancelled.", "AbortError");
     const page = await this.document.getPage(pageIndex + 1);
+    if (signal?.aborted) {
+      page.cleanup();
+      throw new DOMException("The page render was cancelled.", "AbortError");
+    }
     const natural = page.getViewport({ scale: 1 });
     const viewport = page.getViewport({ scale: Math.max(0.05, targetHeight / natural.height) });
     const canvas = document.createElement("canvas");
@@ -137,9 +182,20 @@ class PdfPageSource implements PageSource {
     canvas.height = Math.max(1, Math.ceil(viewport.height));
     const context = canvas.getContext("2d", { alpha: false });
     if (!context) throw new Error("A 2D canvas context is required for PDF pages.");
+    const task = page.render({ canvas, canvasContext: context, viewport, background: "#ffffff" });
+    const cancel = () => task.cancel();
+    signal?.addEventListener("abort", cancel, { once: true });
     try {
-      await page.render({ canvas, canvasContext: context, viewport, background: "#ffffff" }).promise;
+      await task.promise;
+    } catch (error) {
+      if (signal?.aborted) {
+        canvas.width = 1;
+        canvas.height = 1;
+        throw new DOMException("The page render was cancelled.", "AbortError");
+      }
+      throw error;
     } finally {
+      signal?.removeEventListener("abort", cancel);
       page.cleanup();
     }
     return {
@@ -159,38 +215,19 @@ class PdfPageSource implements PageSource {
 }
 
 export async function createPdfPageSource(src: string | File | Blob): Promise<PageSource> {
-  const pdfjs = await import("pdfjs-dist");
-  pdfjs.GlobalWorkerOptions.workerSrc = packagedWorkerUrl();
+  const resolvedSrc = typeof src === "string" ? new URL(src, document.baseURI).href : src;
 
-  let parameters: Parameters<typeof pdfjs.getDocument>[0];
-  if (typeof src === "string") {
-    const range = await urlRangeTransport(pdfjs, src);
-    parameters = range ? {
-      url: src,
-      docBaseUrl: src,
-      range,
-      rangeChunkSize: RANGE_CHUNK_SIZE,
-      disableStream: true,
-      disableAutoFetch: true,
-    } : {
-      url: src,
-      rangeChunkSize: RANGE_CHUNK_SIZE,
-      disableStream: false,
-      disableAutoFetch: false,
-    };
-  } else {
-    parameters = {
-      range: blobRangeTransport(pdfjs, src),
-      rangeChunkSize: RANGE_CHUNK_SIZE,
-      disableStream: true,
-      disableAutoFetch: true,
-    };
+  if (supportsRasterWorker()) {
+    try {
+      return await WorkerPdfPageSource.create(resolvedSrc);
+    } catch (error) {
+      // Fall back to main-thread rasterization rather than failing the book.
+      console.warn("Flipdocs: PDF raster worker unavailable, rendering on the main thread.", error);
+    }
   }
 
-  const loadingTask = pdfjs.getDocument(parameters);
-  const documentProxy = await loadingTask.promise;
-  const first = await documentProxy.getPage(1);
-  const viewport = first.getViewport({ scale: 1 });
-  first.cleanup();
-  return new PdfPageSource(documentProxy, loadingTask, viewport.width / viewport.height);
+  const pdfjs = await import("pdfjs-dist");
+  pdfjs.GlobalWorkerOptions.workerSrc = packagedWorkerUrl();
+  const opened = await openPdfDocument(pdfjs, resolvedSrc, document.baseURI);
+  return new PdfPageSource(opened.document, opened.loadingTask, opened.pageAspect);
 }

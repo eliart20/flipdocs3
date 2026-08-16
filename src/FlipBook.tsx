@@ -42,6 +42,7 @@ const emptySnapshot: DiagnosticSnapshot = {
   renderCount: 0,
   mode: "desktop",
   zoom: 1,
+  lastTurnPerformance: null,
 };
 
 export const FlipBook = forwardRef<FlipBookHandle, FlipBookProps>(function FlipBook({
@@ -148,6 +149,8 @@ export const FlipBook = forwardRef<FlipBookHandle, FlipBookProps>(function FlipB
     setTuning: (values) => engineRef.current?.setTuning(values),
     setDiagnosticPose: (testCase) => engineRef.current?.setDiagnosticPose(testCase) ?? Promise.resolve(),
     resetPose: () => engineRef.current?.resetPose(),
+    runBenchmark: (durationMs, mode) => engineRef.current?.runBenchmark(durationMs, mode)
+      ?? Promise.reject(new Error("Flipbook is not ready.")),
     downloadPng: (filename) => engineRef.current?.downloadPng(filename),
     getSnapshot: () => engineRef.current?.getSnapshot() ?? { ...emptySnapshot, direction },
   }), [direction]);
@@ -179,6 +182,9 @@ export const FlipBook = forwardRef<FlipBookHandle, FlipBookProps>(function FlipB
       data-active-case={snapshot.activeCase ?? "none"}
       tabIndex={0}
       onKeyDown={handleKey}
+      onPointerDownCapture={(event) => {
+        if (event.target === canvasRef.current) rootRef.current?.focus({ preventScroll: true });
+      }}
       aria-label="Flipbook document viewer"
     >
       <canvas ref={canvasRef} className="flipdocs__canvas" aria-label="Rendered document pages" />
@@ -201,13 +207,13 @@ export const FlipBook = forwardRef<FlipBookHandle, FlipBookProps>(function FlipB
 
       {showControls && (
         <nav className="flipdocs__controls" aria-label="Document controls">
-          <button type="button" onClick={() => engineRef.current?.previous()} disabled={atStart} aria-label="Previous page">
+          <button type="button" onClick={() => engineRef.current?.previous()} disabled={atStart} aria-label="Previous page" aria-keyshortcuts={direction === "ltr" ? "ArrowLeft" : "ArrowRight"}>
             <Icon name="previous" />
           </button>
           <div className="flipdocs__page-count" aria-live="polite">
             <span>{snapshot.page || 1}</span><i>/</i><span>{snapshot.pageCount || "—"}</span>
           </div>
-          <button type="button" onClick={() => engineRef.current?.next()} disabled={atEnd} aria-label="Next page">
+          <button type="button" onClick={() => engineRef.current?.next()} disabled={atEnd} aria-label="Next page" aria-keyshortcuts={direction === "ltr" ? "ArrowRight" : "ArrowLeft"}>
             <Icon name="next" />
           </button>
           <span className="flipdocs__divider" />

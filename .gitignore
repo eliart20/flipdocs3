@@ -3,5 +3,6 @@ dist/
 public/demo.pdf
 public/pdf.worker.min.mjs
 coverage/
+.codex-remote-attachments/
 .DS_Store
 *.log

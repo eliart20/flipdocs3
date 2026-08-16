@@ -12,7 +12,8 @@
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/flipdocs.js"
+      "import": "./dist/flipdocs.js",
+      "default": "./dist/flipdocs.js"
     },
     "./style.css": "./dist/flipdocs.css",
     "./pdf.worker.min.mjs": "./dist/pdf.worker.min.mjs"
@@ -30,17 +31,37 @@
     "test": "vitest run",
     "preview": "vite preview",
     "audit": "node scripts/audit-package.mjs",
+    "prepare": "npm run build",
     "prepublishOnly": "npm run typecheck && npm run test && npm run build && npm run audit"
   },
   "keywords": [
+    "react",
     "pdf",
     "pdf-viewer",
     "flipbook",
+    "page-flip",
     "page-turn",
     "pdfjs",
-    "typescript"
+    "threejs",
+    "typescript",
+    "webgl"
   ],
   "license": "MIT",
+  "author": {
+    "name": "eliart20",
+    "url": "https://github.com/eliart20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/eliart20/flipdocs3.git"
+  },
+  "bugs": {
+    "url": "https://github.com/eliart20/flipdocs3/issues"
+  },
+  "homepage": "https://github.com/eliart20/flipdocs3#readme",
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
     "pdfjs-dist": "5.5.207",
     "three": "^0.179.1"

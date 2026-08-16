@@ -1,5 +1,7 @@
 export { FlipBook, DEFAULT_TUNING } from "./FlipBook";
 export type {
+  BenchmarkResult,
+  BenchmarkMode,
   DiagnosticCase,
   DiagnosticSnapshot,
   FlipBookHandle,
@@ -10,4 +12,5 @@ export type {
   ReadingDirection,
   ReadyEvent,
   SpineOptions,
+  TurnPerformanceSnapshot,
 } from "./types";

@@ -10,7 +10,7 @@ export interface PageSurface {
 export interface PageSource {
   readonly pageCount: number;
   readonly pageAspect: number;
-  render(pageIndex: number, targetHeight: number): Promise<PageSurface>;
+  render(pageIndex: number, targetHeight: number, signal?: AbortSignal): Promise<PageSurface>;
   dispose(): void;
 }
 

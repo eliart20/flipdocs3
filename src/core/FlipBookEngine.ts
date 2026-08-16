@@ -1,17 +1,16 @@
 import {
   Color,
-  DirectionalLight,
   Mesh,
   MeshBasicMaterial,
   OrthographicCamera,
-  PCFSoftShadowMap,
   PlaneGeometry,
   Scene,
-  ShadowMaterial,
   Texture,
   WebGLRenderer,
 } from "three";
 import type {
+  BenchmarkMode,
+  BenchmarkResult,
   DiagnosticCase,
   DiagnosticSnapshot,
   FlipBookSource,
@@ -24,15 +23,31 @@ import type {
   ReadyEvent,
   SpineOptions,
   SpreadPages,
+  TurnPerformanceSnapshot,
 } from "../types";
-import { createPageSource, type PageSource } from "../source/PageSource";
-import { PageTextureCache, type TextureEntry } from "./PageTextureCache";
 import {
-  DEFAULT_SEGMENTS_X,
-  DEFAULT_SEGMENTS_Y,
+  advanceAnimationTime,
+  automaticVerticalInfluence,
+  buildEqualMotionPath,
+  canonicalArrowInteraction,
+  progressAlongEqualMotionPath,
+  smoothTurnProgress,
+  summarizeBenchmark,
+  summarizeTurnPerformance,
+  type EqualMotionPath,
+} from "./animation";
+import { createPageSource, type PageSource } from "../source/PageSource";
+import {
+  PageTextureCache,
+  type TextureEntry,
+  type TextureRequestPriority,
+} from "./PageTextureCache";
+import {
   clamp01,
+  deformPointWithState,
   solveCurlState,
   solveProgressForPointer,
+  type CurlState,
 } from "./curlGeometry";
 import {
   classifyGesture,
@@ -52,32 +67,33 @@ import {
   spreadForPage,
 } from "./pageSelection";
 import {
-  createCurlDepthMaterial,
   createCurlMaterial,
+  createFakeShadowMaterial,
   pageMaterial,
-  type CurlDepthMaterial,
   type CurlMaterial,
+  type FakeShadowMaterial,
 } from "./materials";
-import { shadowLightXForTurningSide } from "./shadowDirection";
+import { curlSegmentsForQuality } from "./quality";
 
 const PAGE_WIDTH = 1;
 const Z_SPINE = -0.01;
 const Z_RESTING = 0;
 const Z_SHADOW = 0.004;
 const Z_TURNING = 0.014;
-const SHADOW_SEGMENTS_X = 64;
-const SHADOW_SEGMENTS_Y = 48;
 
 export const DEFAULT_TUNING: FlipBookTuning = {
   curlRadius: 0.085,
+  cornerSag: 0.72,
   minimumLift: 0.018,
   cornerPull: 0.2,
   shadowOpacity: 0.42,
   turnDuration: 620,
+  minimumTurnFrames: 38,
   gestureSlop: 6,
   releaseThreshold: 0.34,
   mobilePeek: 0.075,
   qualityScale: 1.08,
+  meshQuality: 1,
 };
 
 export interface EngineCallbacks {
@@ -120,6 +136,8 @@ interface ActiveTurn {
   grabY: number;
   targetY: number;
   verticalInfluence: number;
+  automaticArc: boolean;
+  motionPath: EqualMotionPath | null;
 }
 
 interface PointerState {
@@ -147,6 +165,59 @@ interface FocusSlide {
   progress: number;
 }
 
+interface LongAnimationFrameCapture {
+  supported: boolean;
+  durations: number[];
+  observer: PerformanceObserver | null;
+}
+
+interface ActiveTurnMeasurement {
+  kind: TurnPerformanceSnapshot["kind"];
+  requestedAt: number;
+  renderedAt: number[];
+  longFrames: LongAnimationFrameCapture;
+}
+
+function startLongAnimationFrameCapture(): LongAnimationFrameCapture {
+  const capture: LongAnimationFrameCapture = {
+    supported: false,
+    durations: [],
+    observer: null,
+  };
+  if (
+    typeof PerformanceObserver === "undefined"
+    || !PerformanceObserver.supportedEntryTypes.includes("long-animation-frame")
+  ) return capture;
+
+  try {
+    capture.observer = new PerformanceObserver((list) => {
+      for (const entry of list.getEntries()) {
+        if (Number.isFinite(entry.duration) && entry.duration >= 0) {
+          capture.durations.push(entry.duration);
+        }
+      }
+    });
+    capture.observer.observe({ type: "long-animation-frame" });
+    capture.supported = true;
+  } catch {
+    capture.observer?.disconnect();
+    capture.observer = null;
+  }
+  return capture;
+}
+
+function stopLongAnimationFrameCapture(capture: LongAnimationFrameCapture): void {
+  const observer = capture.observer;
+  if (!observer) return;
+  for (const entry of observer.takeRecords()) {
+    if (Number.isFinite(entry.duration) && entry.duration >= 0) {
+      capture.durations.push(entry.duration);
+    }
+  }
+  observer.disconnect();
+  capture.observer = null;
+}
+
 function makePaperTexture(): Texture {
   const canvas = document.createElement("canvas");
   canvas.width = 8;
@@ -171,10 +242,6 @@ function sideOfPage(spread: SpreadPages, page: number): PageSide | null {
   return null;
 }
 
-function easeInOutCubic(value: number): number {
-  return value < 0.5 ? 4 * value * value * value : 1 - Math.pow(-2 * value + 2, 3) / 2;
-}
-
 function isAbort(error: unknown): boolean {
   return error instanceof DOMException && error.name === "AbortError";
 }
@@ -191,15 +258,10 @@ export class FlipBookEngine {
   private readonly leftMesh: Mesh<PlaneGeometry, MeshBasicMaterial>;
   private readonly rightMesh: Mesh<PlaneGeometry, MeshBasicMaterial>;
   private readonly curlMaterial: CurlMaterial;
-  private readonly curlDepthMaterial: CurlDepthMaterial;
   private readonly curlMesh: Mesh<PlaneGeometry, CurlMaterial>;
-  private readonly shadowCasterMaterial: MeshBasicMaterial;
-  private readonly shadowCasterMesh: Mesh<PlaneGeometry, MeshBasicMaterial>;
-  private readonly leftShadowMaterial: ShadowMaterial;
-  private readonly rightShadowMaterial: ShadowMaterial;
-  private readonly leftShadowMesh: Mesh<PlaneGeometry, ShadowMaterial>;
-  private readonly rightShadowMesh: Mesh<PlaneGeometry, ShadowMaterial>;
-  private readonly shadowLight: DirectionalLight;
+  private readonly fakeShadowMaterial: FakeShadowMaterial;
+  private readonly leftShadowMesh: Mesh<PlaneGeometry, FakeShadowMaterial>;
+  private readonly rightShadowMesh: Mesh<PlaneGeometry, FakeShadowMaterial>;
   private readonly spineMaterial: MeshBasicMaterial;
   private readonly spineMesh: Mesh<PlaneGeometry, MeshBasicMaterial>;
   private readonly resizeObserver: ResizeObserver;
@@ -238,6 +300,12 @@ export class FlipBookEngine {
   private animationFrame: number | null = null;
   private renderFrame: number | null = null;
   private zoomRasterTimer: number | null = null;
+  private turnSettledTimer: number | null = null;
+  private preloadToken = 0;
+  private benchmarkCancel: (() => void) | null = null;
+  private benchmarking = false;
+  private activeTurnMeasurement: ActiveTurnMeasurement | null = null;
+  private lastTurnPerformance: TurnPerformanceSnapshot | null = null;
   private destroyed = false;
 
   private renderCount = 0;
@@ -273,9 +341,6 @@ export class FlipBookEngine {
     this.renderer.setClearColor(new Color("#000000"), 0);
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, this.maxPixelRatio));
     this.renderer.outputColorSpace = "srgb";
-    this.renderer.shadowMap.enabled = true;
-    this.renderer.shadowMap.type = PCFSoftShadowMap;
-    this.renderer.shadowMap.autoUpdate = false;
     this.camera.position.set(0, 0, 5);
     this.camera.lookAt(0, 0, 0);
 
@@ -286,19 +351,11 @@ export class FlipBookEngine {
     this.rightMesh.position.z = Z_RESTING;
     this.scene.add(this.leftMesh, this.rightMesh);
 
-    this.leftShadowMaterial = new ShadowMaterial({
-      color: new Color("#07101b"),
-      opacity: this.tuning.shadowOpacity,
-      depthWrite: false,
-      toneMapped: false,
-    });
-    this.rightShadowMaterial = this.leftShadowMaterial.clone();
-    this.leftShadowMesh = new Mesh(pageGeometry.clone(), this.leftShadowMaterial);
-    this.rightShadowMesh = new Mesh(pageGeometry.clone(), this.rightShadowMaterial);
+    this.fakeShadowMaterial = createFakeShadowMaterial(this.tuning.shadowOpacity);
+    this.leftShadowMesh = new Mesh(pageGeometry.clone(), this.fakeShadowMaterial);
+    this.rightShadowMesh = new Mesh(pageGeometry.clone(), this.fakeShadowMaterial);
     this.leftShadowMesh.position.z = Z_SHADOW;
     this.rightShadowMesh.position.z = Z_SHADOW;
-    this.leftShadowMesh.receiveShadow = true;
-    this.rightShadowMesh.receiveShadow = true;
     this.leftShadowMesh.visible = false;
     this.rightShadowMesh.visible = false;
     this.scene.add(this.leftShadowMesh, this.rightShadowMesh);
@@ -309,42 +366,11 @@ export class FlipBookEngine {
       this.paperTexture,
       this.pageHeight,
     );
-    this.curlDepthMaterial = createCurlDepthMaterial();
     this.curlMesh = new Mesh(curlGeometry, this.curlMaterial);
     this.curlMesh.frustumCulled = false;
     this.curlMesh.visible = false;
     this.curlMesh.position.z = Z_TURNING;
     this.scene.add(this.curlMesh);
-
-    this.shadowCasterMaterial = new MeshBasicMaterial({
-      colorWrite: false,
-      depthWrite: false,
-      depthTest: false,
-      toneMapped: false,
-    });
-    this.shadowCasterMesh = new Mesh(
-      this.createCurlGeometry(SHADOW_SEGMENTS_X, SHADOW_SEGMENTS_Y),
-      this.shadowCasterMaterial,
-    );
-    this.shadowCasterMesh.customDepthMaterial = this.curlDepthMaterial;
-    this.shadowCasterMesh.castShadow = true;
-    this.shadowCasterMesh.frustumCulled = false;
-    this.curlMesh.add(this.shadowCasterMesh);
-
-    this.shadowLight = new DirectionalLight(0xffffff, 1);
-    this.shadowLight.position.set(0, 1.1, 3.2);
-    this.shadowLight.target.position.set(0, 0, 0);
-    this.shadowLight.castShadow = true;
-    this.shadowLight.shadow.mapSize.set(512, 512);
-    this.shadowLight.shadow.camera.left = -1.35;
-    this.shadowLight.shadow.camera.right = 1.35;
-    this.shadowLight.shadow.camera.top = 1.15;
-    this.shadowLight.shadow.camera.bottom = -1.15;
-    this.shadowLight.shadow.camera.near = 0.2;
-    this.shadowLight.shadow.camera.far = 7;
-    this.shadowLight.shadow.bias = -0.00035;
-    this.shadowLight.shadow.normalBias = 0.002;
-    this.scene.add(this.shadowLight, this.shadowLight.target);
 
     this.spineMaterial = new MeshBasicMaterial({ color: this.spine.color, toneMapped: false });
     this.spineMesh = new Mesh(new PlaneGeometry(this.gapWorld, this.pageHeight), this.spineMaterial);
@@ -405,10 +431,13 @@ export class FlipBookEngine {
 
   async setSource(sourceDefinition: FlipBookSource): Promise<void> {
     const generation = ++this.sourceGeneration;
+    this.preloadToken += 1;
     this.hoverRequest += 1;
     this.viewToken += 1;
     this.callbacks.onLoadingChange?.(true);
     this.stopAnimation();
+    this.cancelTurnMeasurement();
+    this.lastTurnPerformance = null;
     this.activeTurn = null;
     this.focusSlide = null;
     this.curlMesh.visible = false;
@@ -452,17 +481,21 @@ export class FlipBookEngine {
   }
 
   private createCurlGeometry(
-    segmentsX = DEFAULT_SEGMENTS_X,
-    segmentsY = DEFAULT_SEGMENTS_Y,
+    segments = curlSegmentsForQuality(this.tuning.meshQuality),
   ): PlaneGeometry {
     const geometry = new PlaneGeometry(
       PAGE_WIDTH,
       this.pageHeight,
-      segmentsX,
-      segmentsY,
+      segments.x,
+      segments.y,
     );
     geometry.translate(PAGE_WIDTH / 2, 0, 0);
     return geometry;
+  }
+
+  private rebuildCurlGeometry(): void {
+    this.curlMesh.geometry.dispose();
+    this.curlMesh.geometry = this.createCurlGeometry();
   }
 
   private rebuildPageGeometry(): void {
@@ -475,7 +508,6 @@ export class FlipBookEngine {
     replace(this.leftShadowMesh, new PlaneGeometry(PAGE_WIDTH, this.pageHeight));
     replace(this.rightShadowMesh, new PlaneGeometry(PAGE_WIDTH, this.pageHeight));
     replace(this.curlMesh, this.createCurlGeometry());
-    replace(this.shadowCasterMesh, this.createCurlGeometry(SHADOW_SEGMENTS_X, SHADOW_SEGMENTS_Y));
     replace(this.spineMesh, new PlaneGeometry(this.gapWorld, this.pageHeight));
     this.curlMaterial.uniforms.uPageHeight.value = this.pageHeight;
   }
@@ -580,6 +612,12 @@ export class FlipBookEngine {
     );
   }
 
+  /** A bounded motion texture makes cold PDF turns start quickly; rest pages sharpen afterward. */
+  private turnTextureHeight(): number {
+    const fullHeight = this.targetTextureHeight(true);
+    return Math.min(fullHeight, 768, Math.max(384, Math.round(fullHeight * 0.62)));
+  }
+
   private async showStableSpread(awaitVisible: boolean): Promise<void> {
     if (!this.cache || !this.pageCount) return;
     const spread = spreadForPage(this.page, this.pageCount, this.direction);
@@ -613,15 +651,9 @@ export class FlipBookEngine {
     if (!visible || !this.activeTurn || this.tuning.shadowOpacity <= 0.001) {
       this.leftShadowMesh.visible = false;
       this.rightShadowMesh.visible = false;
-      this.shadowCasterMesh.visible = false;
       return;
     }
-    this.shadowCasterMesh.visible = true;
-    this.leftShadowMaterial.opacity = this.tuning.shadowOpacity;
-    this.rightShadowMaterial.opacity = this.tuning.shadowOpacity;
-    // Never choose a receiver in application code. A real shadow can cross the
-    // gutter at any drag angle, so every visible page beneath the sheet must
-    // receive it and the light's depth map alone decides where it lands.
+    this.fakeShadowMaterial.uniforms.uOpacity.value = this.tuning.shadowOpacity;
     this.leftShadowMesh.visible = this.leftMesh.visible;
     this.rightShadowMesh.visible = this.rightMesh.visible;
   }
@@ -645,7 +677,7 @@ export class FlipBookEngine {
     this.requestRender();
 
     try {
-      const entry = await this.cache.request(pageIndex, targetHeight);
+      const entry = await this.cache.request(pageIndex, targetHeight, "visible");
       const expected = side === "left" ? this.displayedSpread.left : this.displayedSpread.right;
       if (token !== this.viewToken || expected !== pageNumber || this.destroyed) return;
       this.installTexture(mesh, entry);
@@ -665,27 +697,71 @@ export class FlipBookEngine {
     if (!this.cache) return;
     const pinned = pagesInSpread(this.displayedSpread).map((page) => page - 1);
     if (this.activeTurn) {
-      pinned.push(this.activeTurn.faces.frontPage - 1);
-      if (this.activeTurn.faces.backPage !== null) pinned.push(this.activeTurn.faces.backPage - 1);
+      const faces = this.activeTurn.faces;
+      pinned.push(
+        ...pagesInSpread(faces.source).map((page) => page - 1),
+        ...pagesInSpread(faces.target).map((page) => page - 1),
+        ...pagesInSpread(faces.underlay).map((page) => page - 1),
+        faces.frontPage - 1,
+      );
+      if (faces.backPage !== null) pinned.push(faces.backPage - 1);
     }
     this.cache.setPinned(pinned);
   }
 
   private preloadNearby(): void {
-    if (!this.cache || !this.pageCount) return;
-    const height = this.targetTextureHeight(true);
+    if (!this.cache || !this.pageCount || this.activeTurn || this.focusSlide || this.benchmarking) return;
+    const cache = this.cache;
+    cache.cancelPreloads();
+    const token = ++this.preloadToken;
+    const sourceGeneration = this.sourceGeneration;
+    const originPage = this.page;
+    const fullHeight = this.targetTextureHeight(true);
     const ordered: number[] = [];
-    for (let offset = 1; offset <= Math.max(2, this.preloadRadius); offset += 1) {
+    const visible = new Set(pagesInSpread(this.displayedSpread));
+    for (let offset = 1; offset <= Math.max(3, this.preloadRadius); offset += 1) {
       if (this.page + offset <= this.pageCount) ordered.push(this.page + offset);
     }
-    for (let offset = 1; offset <= Math.max(1, this.preloadRadius); offset += 1) {
+    for (let offset = 1; offset <= Math.max(2, this.preloadRadius); offset += 1) {
       if (this.page - offset >= 1) ordered.push(this.page - offset);
     }
-    for (const page of ordered) {
-      void this.cache.request(page - 1, height).then(() => this.requestRender()).catch((error) => {
+    const pages = [...new Set(ordered)].filter((page) => !visible.has(page));
+    const isCurrent = () => (
+      token === this.preloadToken
+      && sourceGeneration === this.sourceGeneration
+      && originPage === this.page
+      && cache === this.cache
+      && !this.activeTurn
+      && !this.focusSlide
+      && !this.benchmarking
+      && !this.destroyed
+    );
+    const waitForIdle = () => new Promise<void>((resolve) => {
+      if ("requestIdleCallback" in window) {
+        window.requestIdleCallback(() => resolve(), { timeout: 500 });
+      } else {
+        setTimeout(resolve, 32);
+      }
+    });
+    const fill = async (height: number) => {
+      for (const page of pages) {
+        await waitForIdle();
+        if (!isCurrent()) return false;
+        const entry = await cache.request(page - 1, height, "preload");
+        if (!isCurrent()) return false;
+        this.renderer.initTexture(entry.texture);
+      }
+      return true;
+    };
+    void (async () => {
+      try {
+        // Preload straight to full display resolution: page turns reuse these
+        // textures, so a warmed window flips sharp with no mid-turn raster.
+        await fill(fullHeight);
+      } catch (error) {
         if (!isAbort(error)) this.callbacks.onError?.(error instanceof Error ? error : new Error(String(error)));
-      });
-    }
+      }
+    })();
   }
 
   private scheduleSharpRefresh(): void {
@@ -703,7 +779,7 @@ export class FlipBookEngine {
     const jobs: Promise<void>[] = [];
     const refresh = (mesh: Mesh<PlaneGeometry, MeshBasicMaterial>, pageNumber: number | null) => {
       if (pageNumber === null) return;
-      jobs.push(this.cache!.request(pageNumber - 1, height).then((entry) => {
+      jobs.push(this.cache!.request(pageNumber - 1, height, "visible").then((entry) => {
         if (token !== this.viewToken || this.destroyed) return;
         this.installTexture(mesh, entry);
         this.requestRender();
@@ -726,12 +802,14 @@ export class FlipBookEngine {
     return this.navigationTarget(navigation) !== this.page;
   }
 
-  private async textureForPage(pageNumber: number | null): Promise<Texture> {
-    if (pageNumber === null || !this.cache) return this.paperTexture;
-    const pageIndex = pageNumber - 1;
-    const ready = this.cache.peek(pageIndex);
-    if (ready) return ready.texture;
-    return (await this.cache.request(pageIndex, this.targetTextureHeight())).texture;
+  private async textureForPage(
+    cache: PageTextureCache,
+    pageNumber: number | null,
+    targetHeight: number,
+    priority: TextureRequestPriority,
+  ): Promise<Texture> {
+    if (pageNumber === null) return this.paperTexture;
+    return (await cache.request(pageNumber - 1, targetHeight, priority)).texture;
   }
 
   private async prepareTurn(
@@ -740,23 +818,44 @@ export class FlipBookEngine {
     corner: "top" | "bottom" | null,
     interaction?: Pick<ActiveTurn, "grabX" | "grabY" | "targetY" | "verticalInfluence">,
     initialProgress = hover ? 0.075 : 0,
+    automaticArc = false,
+    targetPageOverride?: number,
   ): Promise<ActiveTurn | null> {
     if (!this.cache || !this.pageCount) return null;
-    const targetPage = this.navigationTarget(navigation);
+    const cache = this.cache;
+    const targetPage = targetPageOverride ?? this.navigationTarget(navigation);
     if (targetPage === this.page) return null;
     const faces = selectPageFaces(this.page, targetPage, this.pageCount, this.direction, navigation);
     if (!faces) return null;
     const request = ++this.hoverRequest;
-    const sourcePages = pagesInSpread(faces.source).map((page) => page - 1);
-    sourcePages.push(faces.frontPage - 1);
-    if (faces.backPage !== null) sourcePages.push(faces.backPage - 1);
-    this.cache.setPinned(sourcePages);
-
-    const [front, back] = await Promise.all([
-      this.textureForPage(faces.frontPage),
-      this.textureForPage(faces.backPage),
-    ]);
+    this.preloadToken += 1;
+    cache.setCriticalMode(true);
+    const requiredPages = [...new Set([
+      ...pagesInSpread(faces.source),
+      ...pagesInSpread(faces.underlay),
+      faces.frontPage,
+      ...(faces.backPage === null ? [] : [faces.backPage]),
+    ])];
+    cache.setPinned(requiredPages.map((page) => page - 1));
+    const turnHeight = this.turnTextureHeight();
+    const textures = new Map<number, Texture>();
+    try {
+      await Promise.all(requiredPages.map(async (page) => {
+        textures.set(page, await this.textureForPage(cache, page, turnHeight, "turn"));
+      }));
+      for (const texture of textures.values()) this.renderer.initTexture(texture);
+    } catch (error) {
+      if (request === this.hoverRequest && cache === this.cache && !this.activeTurn) {
+        cache.setCriticalMode(false);
+        this.preloadNearby();
+      }
+      throw error;
+    }
     if (request !== this.hoverRequest || this.destroyed) return null;
+    const front = textures.get(faces.frontPage) ?? this.paperTexture;
+    const back = faces.backPage === null
+      ? this.paperTexture
+      : textures.get(faces.backPage) ?? this.paperTexture;
 
     const sourceFocus = this.stableFocus(this.page, faces.source);
     const targetFocus = this.stableFocus(targetPage, faces.target);
@@ -784,16 +883,19 @@ export class FlipBookEngine {
       grabY: interaction?.grabY ?? defaultGrabY,
       targetY: interaction?.targetY ?? defaultTargetY,
       verticalInfluence: interaction?.verticalInfluence ?? 1,
+      automaticArc,
+      motionPath: null,
     };
+    if (automaticArc) turn.motionPath = this.buildAutomaticMotionPath(turn);
     this.activeTurn = turn;
     this.curlMaterial.uniforms.uFrontMap.value = front;
     this.curlMaterial.uniforms.uBackMap.value = back;
     const sideSign = faces.turningSide === "right" ? 1 : -1;
     this.curlMaterial.uniforms.uSideSign.value = sideSign;
-    this.curlDepthMaterial.curlUniforms.uSideSign.value = sideSign;
-    this.shadowLight.position.x = shadowLightXForTurningSide(faces.turningSide);
+    this.fakeShadowMaterial.uniforms.uSideSign.value = sideSign;
     this.curlMaterial.uniforms.uMirrored.value = faces.turningSide === "left" ? 1 : 0;
     this.curlMesh.position.x = faces.turningSide === "right" ? this.gapWorld / 2 : -this.gapWorld / 2;
+    this.fakeShadowMaterial.uniforms.uHingeX.value = this.curlMesh.position.x;
     this.curlMesh.visible = true;
 
     if (!hover) void this.showSpread(faces.underlay, false);
@@ -815,46 +917,127 @@ export class FlipBookEngine {
     this.renderNow();
   }
 
-  private setTurnProgress(value: number, immediate = false): void {
-    if (!this.activeTurn) return;
+  private setTurnProgress(value: number, immediate = false): CurlState | null {
+    if (!this.activeTurn) return null;
     const progress = Math.min(1, Math.max(0, value));
     this.activeTurn.progress = progress;
+    if (this.activeTurn.automaticArc) {
+      this.activeTurn.verticalInfluence = automaticVerticalInfluence(progress);
+    }
     this.curlMaterial.uniforms.uProgress.value = progress;
-    const curlState = solveCurlState(PAGE_WIDTH, this.pageHeight, {
-      progress,
-      radius: this.tuning.curlRadius,
-      minimumLift: this.tuning.minimumLift,
-      side: this.activeTurn.faces.turningSide,
-      grabX: this.activeTurn.grabX,
-      grabY: this.activeTurn.grabY,
-      targetY: this.activeTurn.targetY,
-      verticalInfluence: this.activeTurn.verticalInfluence,
-    });
+    const curlState = this.solveTurnState(this.activeTurn, progress, this.activeTurn.verticalInfluence);
     this.curlMaterial.uniforms.uAxis.value.set(curlState.axis.x, curlState.axis.y);
     this.curlMaterial.uniforms.uNormal.value.set(curlState.normal.x, curlState.normal.y);
     this.curlMaterial.uniforms.uActualRadius.value = curlState.radius;
     this.curlMaterial.uniforms.uArcLength.value = curlState.arcLength;
-    this.curlDepthMaterial.curlUniforms.uProgress.value = progress;
-    this.curlDepthMaterial.curlUniforms.uAxis.value.set(curlState.axis.x, curlState.axis.y);
-    this.curlDepthMaterial.curlUniforms.uNormal.value.set(curlState.normal.x, curlState.normal.y);
-    this.curlDepthMaterial.curlUniforms.uActualRadius.value = curlState.radius;
-    this.curlDepthMaterial.curlUniforms.uArcLength.value = curlState.arcLength;
+    this.curlMaterial.uniforms.uGrabMaterialY.value = curlState.origin.y;
+    this.curlMaterial.uniforms.uOppositeSpan.value = curlState.oppositeSpan;
+    this.curlMaterial.uniforms.uCornerSagDepth.value = curlState.cornerSagDepth;
+    this.curlMaterial.uniforms.uShadowOpacity.value = this.tuning.shadowOpacity;
+    this.fakeShadowMaterial.uniforms.uProgress.value = progress;
+    this.fakeShadowMaterial.uniforms.uAxis.value.set(curlState.axis.x, curlState.axis.y);
+    this.fakeShadowMaterial.uniforms.uNormal.value.set(curlState.normal.x, curlState.normal.y);
+    this.fakeShadowMaterial.uniforms.uArcLength.value = curlState.arcLength;
     this.setShadowReceiversVisible(true);
     this.updateCamera();
     if (immediate) this.renderNow();
     else this.requestRender();
+    return curlState;
+  }
+
+  private solveTurnState(turn: ActiveTurn, progress: number, verticalInfluence: number): CurlState {
+    return solveCurlState(PAGE_WIDTH, this.pageHeight, {
+      progress,
+      radius: this.tuning.curlRadius,
+      cornerSag: this.tuning.cornerSag,
+      minimumLift: this.tuning.minimumLift,
+      side: turn.faces.turningSide,
+      grabX: turn.grabX,
+      grabY: turn.grabY,
+      targetY: turn.targetY,
+      verticalInfluence,
+    });
+  }
+
+  private sampleTurnMotion(
+    state: CurlState,
+    side: PageSide,
+  ): { sheet: number[]; edge: [number, number, number] } {
+    const sheet: number[] = [];
+    for (const materialY of [-this.pageHeight * 0.45, 0, this.pageHeight * 0.45]) {
+      for (const materialX of [0.25, 0.5, 0.75, 1]) {
+        const point = deformPointWithState(materialX, materialY, side, state);
+        sheet.push(point.x, point.y, point.z);
+      }
+    }
+    const grabbed = deformPointWithState(state.origin.x, state.origin.y, side, state);
+    return { sheet, edge: [grabbed.x, grabbed.y, grabbed.z] };
+  }
+
+  private averageMotion(previous: readonly number[], current: readonly number[]): number {
+    let distance = 0;
+    let points = 0;
+    for (let index = 0; index + 2 < Math.min(previous.length, current.length); index += 3) {
+      distance += Math.hypot(
+        current[index]! - previous[index]!,
+        current[index + 1]! - previous[index + 1]!,
+        current[index + 2]! - previous[index + 2]!,
+      );
+      points += 1;
+    }
+    return points > 0 ? distance / points : 0;
+  }
+
+  private maximumMotion(previous: readonly number[], current: readonly number[]): number {
+    let distance = 0;
+    for (let index = 0; index + 2 < Math.min(previous.length, current.length); index += 3) {
+      distance = Math.max(distance, Math.hypot(
+        current[index]! - previous[index]!,
+        current[index + 1]! - previous[index + 1]!,
+        current[index + 2]! - previous[index + 2]!,
+      ));
+    }
+    return distance;
+  }
+
+  private buildAutomaticMotionPath(turn: ActiveTurn): EqualMotionPath {
+    return buildEqualMotionPath((progress) => {
+      const state = this.solveTurnState(turn, progress, automaticVerticalInfluence(progress));
+      const current = this.sampleTurnMotion(state, turn.faces.turningSide);
+      return [...current.sheet, ...current.edge];
+    }, 160);
+  }
+
+  private progressAlongMotionPath(
+    turn: ActiveTurn,
+    start: number,
+    target: number,
+    eased: number,
+  ): number {
+    const path = turn.motionPath;
+    if (!path) return start + (target - start) * eased;
+    return progressAlongEqualMotionPath(path, start, target, eased);
   }
 
   private async startCanonicalTurn(
     navigation: NavigationDirection,
     corner: "top" | "bottom" | null = null,
     interaction?: Pick<ActiveTurn, "grabX" | "grabY" | "targetY" | "verticalInfluence">,
-  ): Promise<void> {
+  ): Promise<boolean> {
     if (this.activeTurn && this.activeTurn.navigation !== navigation) this.resetPose();
-    const turn = this.activeTurn ?? await this.prepareTurn(navigation, false, corner, interaction);
-    if (!turn) return;
+    const automatic = interaction ? null : canonicalArrowInteraction(corner ?? "bottom");
+    const turn = this.activeTurn ?? await this.prepareTurn(
+      navigation,
+      false,
+      automatic?.corner ?? corner,
+      interaction ?? automatic ?? undefined,
+      undefined,
+      Boolean(automatic),
+    );
+    if (!turn) return false;
     this.commitTurn();
     this.animateTurnTo(1);
+    return true;
   }
 
   private animateTurnTo(target: 0 | 1): void {
@@ -865,15 +1048,28 @@ export class FlipBookEngine {
     const distance = Math.abs(target - start);
     const duration = Math.max(150, this.tuning.turnDuration * Math.max(0.3, distance));
     const startedAt = performance.now();
+    let animationTime = 0;
+    let previousFrameAt = startedAt;
     const startVerticalInfluence = turn.verticalInfluence;
 
     const frame = (now: number) => {
       if (!this.activeTurn || this.destroyed) return;
-      const time = Math.min(1, (now - startedAt) / duration);
-      const eased = easeInOutCubic(time);
-      const progress = start + (target - start) * eased;
-      this.activeTurn.verticalInfluence = startVerticalInfluence * (1 - eased);
+      animationTime = advanceAnimationTime(
+        animationTime,
+        now - previousFrameAt,
+        duration,
+        this.tuning.minimumTurnFrames,
+        distance,
+      );
+      previousFrameAt = now;
+      const time = animationTime;
+      const eased = smoothTurnProgress(time);
+      const progress = this.progressAlongMotionPath(turn, start, target, eased);
+      if (!this.activeTurn.automaticArc) {
+        this.activeTurn.verticalInfluence = startVerticalInfluence * (1 - eased);
+      }
       this.setTurnProgress(progress, true);
+      this.recordTurnFrame();
       if (time < 1) {
         this.animationFrame = requestAnimationFrame(frame);
       } else {
@@ -892,18 +1088,76 @@ export class FlipBookEngine {
     this.setShadowReceiversVisible(false);
     if (completed) this.page = turn.targetPage;
     this.activeCase = null;
+    this.finishTurnMeasurement();
     void this.showStableSpread(false);
     this.updateCamera();
     this.emitPageChange();
-    this.preloadNearby();
+    if (!this.benchmarking) this.scheduleTurnSettled();
     this.requestRender();
   }
 
+  /**
+   * Hold background raster and preload work briefly after a turn so rapid
+   * flipping stays responsive; sharpening resumes once the reader pauses.
+   */
+  private scheduleTurnSettled(): void {
+    if (this.turnSettledTimer !== null) window.clearTimeout(this.turnSettledTimer);
+    this.turnSettledTimer = window.setTimeout(() => {
+      this.turnSettledTimer = null;
+      if (this.destroyed || this.benchmarking || this.activeTurn || this.focusSlide) return;
+      this.cache?.setCriticalMode(false);
+      this.preloadNearby();
+    }, 160);
+  }
+
   private stopAnimation(): void {
+    if (this.benchmarkCancel) {
+      const cancel = this.benchmarkCancel;
+      this.benchmarkCancel = null;
+      cancel();
+      return;
+    }
     if (this.animationFrame !== null) {
       cancelAnimationFrame(this.animationFrame);
       this.animationFrame = null;
     }
+  }
+
+  private beginTurnMeasurement(kind: TurnPerformanceSnapshot["kind"]): ActiveTurnMeasurement {
+    this.cancelTurnMeasurement();
+    const measurement: ActiveTurnMeasurement = {
+      kind,
+      requestedAt: performance.now(),
+      renderedAt: [],
+      longFrames: startLongAnimationFrameCapture(),
+    };
+    this.activeTurnMeasurement = measurement;
+    return measurement;
+  }
+
+  private recordTurnFrame(): void {
+    this.activeTurnMeasurement?.renderedAt.push(performance.now());
+  }
+
+  private finishTurnMeasurement(): void {
+    const measurement = this.activeTurnMeasurement;
+    if (!measurement) return;
+    this.activeTurnMeasurement = null;
+    stopLongAnimationFrameCapture(measurement.longFrames);
+    this.lastTurnPerformance = summarizeTurnPerformance({
+      kind: measurement.kind,
+      requestedAt: measurement.requestedAt,
+      renderedAt: measurement.renderedAt,
+      longAnimationFrameSupported: measurement.longFrames.supported,
+      longAnimationFrames: measurement.longFrames.durations,
+    });
+  }
+
+  private cancelTurnMeasurement(expected?: ActiveTurnMeasurement): void {
+    const measurement = this.activeTurnMeasurement;
+    if (!measurement || (expected && expected !== measurement)) return;
+    this.activeTurnMeasurement = null;
+    stopLongAnimationFrameCapture(measurement.longFrames);
   }
 
   next(): void {
@@ -915,13 +1169,21 @@ export class FlipBookEngine {
   }
 
   private navigate(navigation: NavigationDirection): void {
-    if (!this.canNavigate(navigation) || this.destroyed) return;
+    if (!this.canNavigate(navigation) || this.destroyed || this.benchmarking) return;
     const target = this.navigationTarget(navigation);
     if (this.mobile && isSameSpread(this.page, target, this.pageCount, this.direction)) {
+      this.beginTurnMeasurement("focus");
       this.animateFocusSlide(target);
       return;
     }
-    void this.startCanonicalTurn(navigation);
+    if (this.activeTurn && this.activeTurn.navigation !== navigation) this.resetPose();
+    const measurement = this.beginTurnMeasurement("curl");
+    void this.startCanonicalTurn(navigation).then((started) => {
+      if (!started) this.cancelTurnMeasurement(measurement);
+    }).catch((error) => {
+      this.cancelTurnMeasurement(measurement);
+      if (!isAbort(error)) this.callbacks.onError?.(error instanceof Error ? error : new Error(String(error)));
+    });
   }
 
   goToPage(page: number): void {
@@ -937,24 +1199,40 @@ export class FlipBookEngine {
 
   private animateFocusSlide(targetPage: number, finishAt: 0 | 1 = 1): void {
     this.stopAnimation();
+    this.preloadToken += 1;
+    this.cache?.setCriticalMode(true);
     const slide = this.focusSlide ?? { fromPage: this.page, toPage: targetPage, progress: 0 };
     this.focusSlide = slide;
     const start = slide.progress;
     const startedAt = performance.now();
     const duration = Math.max(140, 280 * Math.abs(finishAt - start));
+    const travel = Math.abs(finishAt - start);
+    let animationTime = 0;
+    let previousFrameAt = startedAt;
     const frame = (now: number) => {
       if (!this.focusSlide || this.destroyed) return;
-      const time = Math.min(1, (now - startedAt) / duration);
-      this.focusSlide.progress = start + (finishAt - start) * easeInOutCubic(time);
+      animationTime = advanceAnimationTime(
+        animationTime,
+        now - previousFrameAt,
+        duration,
+        Math.max(12, Math.round(this.tuning.minimumTurnFrames * 0.55)),
+        travel,
+      );
+      previousFrameAt = now;
+      const time = animationTime;
+      this.focusSlide.progress = start + (finishAt - start) * smoothTurnProgress(time);
       this.updateCamera();
       this.renderNow();
+      this.recordTurnFrame();
       if (time < 1) this.animationFrame = requestAnimationFrame(frame);
       else {
         this.animationFrame = null;
         if (finishAt === 1) this.page = targetPage;
         this.focusSlide = null;
         this.updateCamera();
+        this.finishTurnMeasurement();
         this.emitPageChange();
+        if (!this.benchmarking) this.scheduleTurnSettled();
         this.requestRender();
       }
     };
@@ -989,17 +1267,25 @@ export class FlipBookEngine {
   }
 
   setTuning(values: Partial<FlipBookTuning>): void {
+    const previousMeshQuality = this.tuning.meshQuality;
     this.tuning = {
       curlRadius: Math.min(0.22, Math.max(0.025, values.curlRadius ?? this.tuning.curlRadius)),
+      cornerSag: Math.min(1, Math.max(0, values.cornerSag ?? this.tuning.cornerSag)),
       minimumLift: Math.min(0.08, Math.max(0, values.minimumLift ?? this.tuning.minimumLift)),
       cornerPull: Math.min(0.45, Math.max(0.02, values.cornerPull ?? this.tuning.cornerPull)),
       shadowOpacity: Math.min(0.8, Math.max(0, values.shadowOpacity ?? this.tuning.shadowOpacity)),
       turnDuration: Math.min(1600, Math.max(180, values.turnDuration ?? this.tuning.turnDuration)),
+      minimumTurnFrames: Math.min(60, Math.max(12, Math.round(values.minimumTurnFrames ?? this.tuning.minimumTurnFrames))),
       gestureSlop: Math.min(24, Math.max(2, values.gestureSlop ?? this.tuning.gestureSlop)),
       releaseThreshold: Math.min(0.8, Math.max(0.15, values.releaseThreshold ?? this.tuning.releaseThreshold)),
       mobilePeek: Math.min(0.2, Math.max(0.02, values.mobilePeek ?? this.tuning.mobilePeek)),
       qualityScale: Math.min(2, Math.max(0.6, values.qualityScale ?? this.tuning.qualityScale)),
+      meshQuality: Math.min(1.5, Math.max(0.5, values.meshQuality ?? this.tuning.meshQuality)),
     };
+    const meshQualityChanged = this.tuning.meshQuality !== previousMeshQuality;
+    if (meshQualityChanged) this.rebuildCurlGeometry();
+    this.curlMaterial.uniforms.uShadowOpacity.value = this.tuning.shadowOpacity;
+    this.fakeShadowMaterial.uniforms.uOpacity.value = this.tuning.shadowOpacity;
     this.setShadowReceiversVisible(Boolean(this.activeTurn));
     if (this.activeTurn) this.setTurnProgress(this.activeTurn.progress, true);
     this.resize();
@@ -1040,13 +1326,16 @@ export class FlipBookEngine {
   }
 
   private onPointerDown = (event: PointerEvent): void => {
-    if (!this.interactive || event.button > 1 || !this.pageCount) return;
+    if (!this.interactive || this.benchmarking || event.button > 1 || !this.pageCount) return;
     const world = this.screenToWorld(event.clientX, event.clientY);
     const hit = this.pageHit(world.x, world.y);
     const wantsPan = this.zoom > 1 && (event.button === 1 || event.shiftKey || !hit);
     if (!hit && !wantsPan) return;
     event.preventDefault();
     this.canvas.setPointerCapture(event.pointerId);
+    // A direct pointer gesture supersedes any in-flight arrow measurement;
+    // otherwise its synchronous drag renders would make that trace incomplete.
+    this.cancelTurnMeasurement();
 
     if (wantsPan) {
       this.pointer = {
@@ -1147,6 +1436,8 @@ export class FlipBookEngine {
       if (this.mobile && isSameSpread(this.page, target, this.pageCount, this.direction)) {
         if (Math.hypot(deltaX, deltaY) < this.tuning.gestureSlop) return;
         pointer.mode = "focus";
+        this.preloadToken += 1;
+        this.cache?.setCriticalMode(true);
         this.focusSlide = { fromPage: this.page, toPage: target, progress: 0 };
       } else {
         const mode = classifyGesture({
@@ -1234,6 +1525,7 @@ export class FlipBookEngine {
     const world = this.screenToWorld(clientX, clientY);
     pointer.targetY = clamp01((world.y + this.pageHeight / 2) / this.pageHeight);
     turn.targetY = pointer.targetY;
+    turn.automaticArc = false;
     turn.verticalInfluence = 1;
     pointer.progressVelocity = pointer.progressVelocity * 0.55
       + ((progress - previousProgress) / Math.max(1, elapsed) * 1000) * 0.45;
@@ -1398,12 +1690,318 @@ export class FlipBookEngine {
     this.sampleStats();
   }
 
+  private measureRafBaseline(sampleCount = 10): Promise<number> {
+    return new Promise((resolve) => {
+      const gaps: number[] = [];
+      let previous: number | null = null;
+      let frameId = 0;
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        if (frameId) cancelAnimationFrame(frameId);
+        clearTimeout(timeoutId);
+        const ordered = gaps.filter((gap) => Number.isFinite(gap) && gap > 0).sort((a, b) => a - b);
+        resolve(ordered[Math.floor(ordered.length / 2)] ?? 1000 / 60);
+      };
+      const frame = (now: number) => {
+        if (previous !== null) gaps.push(now - previous);
+        previous = now;
+        if (gaps.length >= sampleCount) finish();
+        else frameId = requestAnimationFrame(frame);
+      };
+      const timeoutId = setTimeout(finish, 1600);
+      frameId = requestAnimationFrame(frame);
+    });
+  }
+
+  private benchmarkCapacity(navigation: NavigationDirection, limit: number): number {
+    let page = this.page;
+    let turns = 0;
+    while (turns < limit) {
+      const target = desktopTargetPage(page, this.pageCount, navigation);
+      if (target === page) break;
+      page = target;
+      turns += 1;
+    }
+    return turns;
+  }
+
+  private benchmarkPageIndexes(directions: readonly NavigationDirection[]): number[] {
+    const pages = new Set(pagesInSpread(spreadForPage(this.page, this.pageCount, this.direction)));
+    let page = this.page;
+    for (const navigation of directions) {
+      const targetPage = desktopTargetPage(page, this.pageCount, navigation);
+      const faces = selectPageFaces(page, targetPage, this.pageCount, this.direction, navigation);
+      if (!faces) break;
+      for (const pageNumber of [
+        ...pagesInSpread(faces.source),
+        ...pagesInSpread(faces.target),
+        ...pagesInSpread(faces.underlay),
+        faces.frontPage,
+        ...(faces.backPage === null ? [] : [faces.backPage]),
+      ]) pages.add(pageNumber);
+      page = targetPage;
+    }
+    return [...pages].map((pageNumber) => pageNumber - 1);
+  }
+
+  private animateBenchmarkTurn(
+    turn: ActiveTurn,
+    durationMs: number,
+    requestedAt: number,
+    frameIntervals: number[],
+    renderCosts: number[],
+    progressSteps: number[],
+    edgeMotion: number[],
+    sheetMotion: number[],
+    pointMotion: number[],
+  ): Promise<{ frames: number; elapsedMs: number; firstFrameMs: number }> {
+    return new Promise((resolve, reject) => {
+      const startedAt = performance.now();
+      let lastFinishedAt = startedAt;
+      let frames = 0;
+      let firstFrameMs = 0;
+      let settled = false;
+      let animationTime = 0;
+      let previousProgress: number | null = null;
+      let previousMotion: ReturnType<FlipBookEngine["sampleTurnMotion"]> | null = null;
+
+      const cancel = () => {
+        if (settled) return;
+        settled = true;
+        if (this.animationFrame !== null) cancelAnimationFrame(this.animationFrame);
+        this.animationFrame = null;
+        if (this.benchmarkCancel === cancel) this.benchmarkCancel = null;
+        reject(new DOMException("Benchmark interrupted", "AbortError"));
+      };
+
+      const frame = (now: number) => {
+        if (this.destroyed || this.activeTurn !== turn) {
+          cancel();
+          return;
+        }
+        animationTime = advanceAnimationTime(
+          animationTime,
+          now - lastFinishedAt,
+          durationMs,
+          this.tuning.minimumTurnFrames,
+        );
+        const time = animationTime;
+        const renderStartedAt = performance.now();
+        const progress = this.progressAlongMotionPath(turn, 0, 1, smoothTurnProgress(time));
+        const state = this.setTurnProgress(progress, true);
+        const finishedAt = performance.now();
+        if (state) {
+          const currentMotion = this.sampleTurnMotion(state, turn.faces.turningSide);
+          if (previousProgress !== null && previousMotion) {
+            progressSteps.push(Math.abs(turn.progress - previousProgress));
+            edgeMotion.push(this.averageMotion(previousMotion.edge, currentMotion.edge));
+            sheetMotion.push(this.averageMotion(previousMotion.sheet, currentMotion.sheet));
+            pointMotion.push(this.maximumMotion(previousMotion.sheet, currentMotion.sheet));
+          }
+          previousProgress = turn.progress;
+          previousMotion = currentMotion;
+        }
+        frameIntervals.push(finishedAt - lastFinishedAt);
+        renderCosts.push(finishedAt - renderStartedAt);
+        lastFinishedAt = finishedAt;
+        if (frames === 0) firstFrameMs = Math.max(0, finishedAt - requestedAt);
+        frames += 1;
+        if (time < 1) {
+          this.animationFrame = requestAnimationFrame(frame);
+          return;
+        }
+
+        settled = true;
+        this.animationFrame = null;
+        if (this.benchmarkCancel === cancel) this.benchmarkCancel = null;
+        // Synchronize once per completed turn. Calling gl.finish() inside every
+        // rAF changes the cadence being measured and can halve mobile FPS.
+        this.renderer.getContext().finish();
+        this.finishTurn(true);
+        resolve({ frames, elapsedMs: finishedAt - startedAt, firstFrameMs });
+      };
+
+      this.benchmarkCancel = cancel;
+      this.animationFrame = requestAnimationFrame(frame);
+    });
+  }
+
+  async runBenchmark(
+    turnDurationMs = this.tuning.turnDuration,
+    mode: BenchmarkMode = "cold",
+  ): Promise<BenchmarkResult> {
+    if (this.destroyed) throw new Error("The flipbook has been destroyed.");
+    if (this.benchmarking) throw new Error("A benchmark is already running.");
+    if (!this.cache || !this.source || this.pageCount < 2) {
+      throw new Error("Benchmarking requires at least two pages.");
+    }
+
+    const cache = this.cache;
+    const source = this.source;
+    // Travel far enough to exceed the ten-page demo cache on larger PDFs, so
+    // reverse turns cannot all reuse the same warm textures.
+    const outwardLimit = 6;
+    const forwardCapacity = this.benchmarkCapacity("forward", outwardLimit);
+    const backwardCapacity = this.benchmarkCapacity("backward", outwardLimit);
+    const outward: NavigationDirection = forwardCapacity >= backwardCapacity ? "forward" : "backward";
+    const outwardTurns = Math.max(forwardCapacity, backwardCapacity);
+    if (outwardTurns < 1) throw new Error("No page turn is available to benchmark.");
+    const inward: NavigationDirection = outward === "forward" ? "backward" : "forward";
+    const directions: NavigationDirection[] = [
+      ...Array.from({ length: outwardTurns }, () => outward),
+      ...Array.from({ length: outwardTurns }, () => inward),
+    ];
+    const originalPage = this.page;
+    const benchmarkGeneration = this.sourceGeneration;
+    const duration = Math.min(1600, Math.max(180, turnDurationMs));
+    const frameIntervals: number[] = [];
+    const renderCosts: number[] = [];
+    const framesPerTurn: number[] = [];
+    const firstFrameDelays: number[] = [];
+    const progressSteps: number[] = [];
+    const edgeMotion: number[] = [];
+    const sheetMotion: number[] = [];
+    const pointMotion: number[] = [];
+    let longFrames: LongAnimationFrameCapture | null = null;
+    let visibleElapsedMs = 0;
+    let preparationMs = 0;
+    let preloadMs = 0;
+    let rafBaselineFrameMs = 1000 / 60;
+    let totalStartedAt = 0;
+
+    this.benchmarking = true;
+    this.resetPose();
+    try {
+      if (mode === "preloaded") {
+        const preloadStartedAt = performance.now();
+        const pageIndexes = this.benchmarkPageIndexes(directions);
+        cache.reset(source, Math.max(this.cacheSize, pageIndexes.length));
+        cache.setPinned(pageIndexes);
+        const fullHeight = this.targetTextureHeight();
+        const entries = await Promise.all(
+          pageIndexes.map((pageIndex) => cache.request(pageIndex, fullHeight, "turn")),
+        );
+        for (const entry of entries) this.renderer.initTexture(entry.texture);
+        await this.showStableSpread(true);
+        this.renderNow();
+        this.renderer.getContext().finish();
+        preloadMs = performance.now() - preloadStartedAt;
+      }
+
+      rafBaselineFrameMs = await this.measureRafBaseline();
+      longFrames = startLongAnimationFrameCapture();
+      totalStartedAt = performance.now();
+      if (mode === "cold") {
+        const coldStartAt = performance.now();
+        cache.reset(source, this.cacheSize);
+        await this.showStableSpread(true);
+        this.renderNow();
+        this.renderer.getContext().finish();
+        preparationMs += performance.now() - coldStartAt;
+      }
+      cache.setCriticalMode(true);
+
+      for (const navigation of directions) {
+        if (this.destroyed || benchmarkGeneration !== this.sourceGeneration) {
+          throw new DOMException("Benchmark interrupted", "AbortError");
+        }
+        const targetPage = desktopTargetPage(this.page, this.pageCount, navigation);
+        const interaction = canonicalArrowInteraction();
+        const requestedAt = performance.now();
+        const prepareStartedAt = requestedAt;
+        const turn = await this.prepareTurn(
+          navigation,
+          false,
+          interaction.corner,
+          interaction,
+          0,
+          true,
+          targetPage,
+        );
+        preparationMs += performance.now() - prepareStartedAt;
+        if (!turn || this.destroyed) throw new DOMException("Benchmark interrupted", "AbortError");
+        this.commitTurn();
+        const sample = await this.animateBenchmarkTurn(
+          turn,
+          duration,
+          requestedAt,
+          frameIntervals,
+          renderCosts,
+          progressSteps,
+          edgeMotion,
+          sheetMotion,
+          pointMotion,
+        );
+        framesPerTurn.push(sample.frames);
+        firstFrameDelays.push(sample.firstFrameMs);
+        visibleElapsedMs += sample.elapsedMs;
+      }
+
+      const totalElapsedMs = performance.now() - totalStartedAt;
+      // Give Chromium a task boundary to publish the final LoAF entry before
+      // draining the observer. This wait is excluded from benchmark throughput.
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+      stopLongAnimationFrameCapture(longFrames);
+      return summarizeBenchmark({
+        mode,
+        preloadMs,
+        targetFrameMs: 1000 / 60,
+        rafBaselineFrameMs,
+        progressSteps,
+        edgeMotion,
+        sheetMotion,
+        pointMotion,
+        frameIntervals,
+        renderCosts,
+        framesPerTurn,
+        firstFrameDelays,
+        longAnimationFrameSupported: longFrames.supported,
+        longAnimationFrames: longFrames.durations,
+        visibleElapsedMs,
+        totalElapsedMs,
+        preparationMs,
+        cornerSag: this.tuning.cornerSag,
+        minimumTurnFrames: this.tuning.minimumTurnFrames,
+      });
+    } finally {
+      if (longFrames) stopLongAnimationFrameCapture(longFrames);
+      try {
+        if (!this.destroyed && benchmarkGeneration === this.sourceGeneration && cache === this.cache) {
+          cache.setCriticalMode(false);
+          this.activeTurn = null;
+          this.curlMesh.visible = false;
+          this.setShadowReceiversVisible(false);
+          this.page = clampPage(originalPage, this.pageCount);
+          await this.showStableSpread(true);
+          cache.setLimit(this.cacheSize);
+          this.updateCamera();
+          this.emitPageChange();
+          this.requestRender();
+          this.sampleStats();
+        }
+      } finally {
+        this.benchmarking = false;
+        if (!this.destroyed && benchmarkGeneration === this.sourceGeneration) this.preloadNearby();
+      }
+    }
+  }
+
   resetPose(): void {
     this.hoverRequest += 1;
+    this.preloadToken += 1;
+    if (this.turnSettledTimer !== null) {
+      window.clearTimeout(this.turnSettledTimer);
+      this.turnSettledTimer = null;
+    }
     this.stopAnimation();
+    this.cancelTurnMeasurement();
     this.pointer = null;
     this.activeCase = null;
     this.focusSlide = null;
+    this.cache?.cancelPreloads();
+    this.cache?.setCriticalMode(false);
     if (this.activeTurn) {
       this.activeTurn = null;
       this.curlMesh.visible = false;
@@ -1412,6 +2010,7 @@ export class FlipBookEngine {
       this.updateCamera();
       this.requestRender();
     }
+    if (!this.benchmarking) this.preloadNearby();
   }
 
   async toggleFullscreen(): Promise<void> {
@@ -1439,6 +2038,7 @@ export class FlipBookEngine {
       renderCount: this.renderCount,
       mode: this.mobile ? "mobile" : "desktop",
       zoom: this.zoom,
+      lastTurnPerformance: this.lastTurnPerformance,
     };
   }
 
@@ -1466,8 +2066,6 @@ export class FlipBookEngine {
       cancelAnimationFrame(this.renderFrame);
       this.renderFrame = null;
     }
-    this.renderer.shadowMap.needsUpdate = this.curlMesh.visible
-      && (this.leftShadowMesh.visible || this.rightShadowMesh.visible);
     this.renderer.render(this.scene, this.camera);
     this.renderCount += 1;
     this.renderTimes.push(performance.now());
@@ -1485,9 +2083,12 @@ export class FlipBookEngine {
     if (this.destroyed) return;
     this.destroyed = true;
     this.sourceGeneration += 1;
+    this.preloadToken += 1;
     this.stopAnimation();
+    this.cancelTurnMeasurement();
     if (this.renderFrame !== null) cancelAnimationFrame(this.renderFrame);
     if (this.zoomRasterTimer !== null) window.clearTimeout(this.zoomRasterTimer);
+    if (this.turnSettledTimer !== null) window.clearTimeout(this.turnSettledTimer);
     window.clearInterval(this.statsTimer);
     this.resizeObserver.disconnect();
     this.canvas.removeEventListener("pointerdown", this.onPointerDown);
@@ -1503,16 +2104,11 @@ export class FlipBookEngine {
     this.leftShadowMesh.geometry.dispose();
     this.rightShadowMesh.geometry.dispose();
     this.curlMesh.geometry.dispose();
-    this.shadowCasterMesh.geometry.dispose();
     this.spineMesh.geometry.dispose();
     this.leftMaterial.dispose();
     this.rightMaterial.dispose();
     this.curlMaterial.dispose();
-    this.curlDepthMaterial.dispose();
-    this.shadowCasterMaterial.dispose();
-    this.leftShadowMaterial.dispose();
-    this.rightShadowMaterial.dispose();
-    this.shadowLight.shadow.dispose();
+    this.fakeShadowMaterial.dispose();
     this.spineMaterial.dispose();
     this.paperTexture.dispose();
     this.renderer.dispose();

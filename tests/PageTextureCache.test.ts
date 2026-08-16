@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { LinearMipmapLinearFilter } from "three";
 import { PageTextureCache } from "../src/core/PageTextureCache";
 import type { PageSource, PageSurface } from "../src/source/PageSource";
 
@@ -40,6 +41,16 @@ describe("PageTextureCache", () => {
     expect(cache.peek(1)).toBeUndefined();
     expect(cache.peek(2)).toBeDefined();
     expect(source.disposedSurfaces).toEqual([1]);
+    cache.dispose();
+  });
+
+  it("uses mipmapped anisotropic sampling for detailed moving pages", async () => {
+    const source = new FakeSource();
+    const cache = new PageTextureCache(source, 2);
+    const entry = await cache.request(0, 768, "turn");
+    expect(entry.texture.generateMipmaps).toBe(true);
+    expect(entry.texture.minFilter).toBe(LinearMipmapLinearFilter);
+    expect(entry.texture.anisotropy).toBe(4);
     cache.dispose();
   });
 
@@ -88,5 +99,77 @@ describe("PageTextureCache", () => {
     await expect(pending).rejects.toMatchObject({ name: "AbortError" });
     expect(disposed).toEqual([0]);
     expect(cache.size).toBe(0);
+  });
+
+  it("runs one raster at a time and lets a queued turn jump ahead of preloads", async () => {
+    const calls: number[] = [];
+    const releases = new Map<number, (value: PageSurface) => void>();
+    const source: PageSource = {
+      pageCount: 4,
+      pageAspect: 0.75,
+      render: (pageIndex, height) => {
+        calls.push(pageIndex);
+        return new Promise<PageSurface>((resolve) => {
+          releases.set(pageIndex, resolve);
+        }).then(() => surface(pageIndex, height, []));
+      },
+      dispose: () => undefined,
+    };
+    const cache = new PageTextureCache(source, 4);
+    const active = cache.request(0, 100, "turn");
+    const preload = cache.request(1, 100, "preload");
+    const urgent = cache.request(2, 100, "turn");
+    expect(calls).toEqual([0]);
+
+    releases.get(0)?.(surface(0, 100, []));
+    await active;
+    await Promise.resolve();
+    expect(calls).toEqual([0, 2]);
+    releases.get(2)?.(surface(2, 100, []));
+    await urgent;
+    await Promise.resolve();
+    expect(calls).toEqual([0, 2, 1]);
+    releases.get(1)?.(surface(1, 100, []));
+    await preload;
+    cache.dispose();
+  });
+
+  it("aborts speculative raster work and blocks visible upgrades during a turn", async () => {
+    const calls: number[] = [];
+    const releases = new Map<number, (value: PageSurface) => void>();
+    const source: PageSource = {
+      pageCount: 3,
+      pageAspect: 0.75,
+      render: (pageIndex, height, signal) => {
+        calls.push(pageIndex);
+        return new Promise<PageSurface>((resolve, reject) => {
+          releases.set(pageIndex, resolve);
+          signal?.addEventListener("abort", () => {
+            reject(new DOMException("cancelled", "AbortError"));
+          }, { once: true });
+        }).then(() => surface(pageIndex, height, []));
+      },
+      dispose: () => undefined,
+    };
+    const cache = new PageTextureCache(source, 3);
+    const speculative = cache.request(0, 100, "preload");
+    cache.setCriticalMode(true);
+    await expect(speculative).rejects.toMatchObject({ name: "AbortError" });
+
+    const visible = cache.request(1, 100, "visible");
+    const turn = cache.request(2, 100, "turn");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(calls).toEqual([0, 2]);
+    releases.get(2)?.(surface(2, 100, []));
+    await turn;
+    expect(calls).toEqual([0, 2]);
+
+    cache.setCriticalMode(false);
+    await Promise.resolve();
+    expect(calls).toEqual([0, 2, 1]);
+    releases.get(1)?.(surface(1, 100, []));
+    await visible;
+    cache.dispose();
   });
 });
