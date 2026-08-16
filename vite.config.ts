@@ -16,6 +16,7 @@ const regressionPdfs = [
   "FST Menachos (01) -236- (02a-11a).pdf",
   "FST Niddah (01)-284- (02a-11a).pdf",
   "Shir Hashirim HT.pdf",
+  "025 Niddah (20pp flat).pdf",
 ];
 
 function regressionPdfPlugin() {

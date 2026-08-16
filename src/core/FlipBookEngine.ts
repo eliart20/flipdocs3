@@ -301,6 +301,7 @@ export class FlipBookEngine {
   private renderFrame: number | null = null;
   private zoomRasterTimer: number | null = null;
   private turnSettledTimer: number | null = null;
+  private pendingUploads: Texture[] = [];
   private preloadToken = 0;
   private benchmarkCancel: (() => void) | null = null;
   private benchmarking = false;
@@ -838,24 +839,17 @@ export class FlipBookEngine {
     ])];
     cache.setPinned(requiredPages.map((page) => page - 1));
     const turnHeight = this.turnTextureHeight();
-    const textures = new Map<number, Texture>();
-    try {
-      await Promise.all(requiredPages.map(async (page) => {
-        textures.set(page, await this.textureForPage(cache, page, turnHeight, "turn"));
-      }));
-      for (const texture of textures.values()) this.renderer.initTexture(texture);
-    } catch (error) {
-      if (request === this.hoverRequest && cache === this.cache && !this.activeTurn) {
-        cache.setCriticalMode(false);
-        this.preloadNearby();
-      }
-      throw error;
-    }
     if (request !== this.hoverRequest || this.destroyed) return null;
-    const front = textures.get(faces.frontPage) ?? this.paperTexture;
-    const back = faces.backPage === null
-      ? this.paperTexture
-      : textures.get(faces.backPage) ?? this.paperTexture;
+
+    // Never gate the turn on rasterization: the sheet's front face is the page
+    // already on screen, so the curl can start on the next frame. Cold faces
+    // seed as paper and swap in as their textures land.
+    const seedTexture = (page: number | null): Texture => {
+      if (page === null) return this.paperTexture;
+      return cache.peek(page - 1)?.texture ?? this.paperTexture;
+    };
+    const front = seedTexture(faces.frontPage);
+    const back = seedTexture(faces.backPage);
 
     const sourceFocus = this.stableFocus(this.page, faces.source);
     const targetFocus = this.stableFocus(targetPage, faces.target);
@@ -902,7 +896,36 @@ export class FlipBookEngine {
     this.setShadowReceiversVisible(true);
     this.updatePins();
     this.setTurnProgress(initialProgress, true);
+
+    // Stream the real textures onto the live turn as they finish rendering.
+    void Promise.all(requiredPages.map(async (page) => {
+      const texture = await this.textureForPage(cache, page, turnHeight, "turn");
+      if (this.destroyed || this.activeTurn !== turn) return;
+      this.queueTextureUpload(texture);
+      if (page === faces.frontPage) this.curlMaterial.uniforms.uFrontMap.value = texture;
+      if (page === faces.backPage) this.curlMaterial.uniforms.uBackMap.value = texture;
+      this.refreshRestingTexture(page, texture);
+      this.requestRender();
+    })).catch((error) => {
+      if (!isAbort(error)) this.callbacks.onError?.(error instanceof Error ? error : new Error(String(error)));
+      if (request === this.hoverRequest && cache === this.cache && !this.activeTurn) {
+        cache.setCriticalMode(false);
+        this.preloadNearby();
+      }
+    });
     return turn;
+  }
+
+  /** Install a late-arriving texture on whichever resting mesh shows the page. */
+  private refreshRestingTexture(pageNumber: number, texture: Texture): void {
+    const install = (mesh: Mesh<PlaneGeometry, MeshBasicMaterial>, page: number | null) => {
+      if (page !== pageNumber || !mesh.visible) return;
+      if (mesh.material.map === texture) return;
+      mesh.material.map = texture;
+      mesh.material.needsUpdate = true;
+    };
+    install(this.leftMesh, this.displayedSpread.left);
+    install(this.rightMesh, this.displayedSpread.right);
   }
 
   private commitTurn(): void {
@@ -2060,16 +2083,25 @@ export class FlipBookEngine {
     });
   }
 
+  /** Spread pending GPU uploads one per frame so they never stack in one frame. */
+  private queueTextureUpload(texture: Texture): void {
+    if (!this.pendingUploads.includes(texture)) this.pendingUploads.push(texture);
+    this.requestRender();
+  }
+
   private renderNow(): void {
     if (this.destroyed) return;
     if (this.renderFrame !== null) {
       cancelAnimationFrame(this.renderFrame);
       this.renderFrame = null;
     }
+    const upload = this.pendingUploads.shift();
+    if (upload) this.renderer.initTexture(upload);
     this.renderer.render(this.scene, this.camera);
     this.renderCount += 1;
     this.renderTimes.push(performance.now());
     this.cache?.disposeRetired();
+    if (this.pendingUploads.length > 0) this.requestRender();
   }
 
   private sampleStats(): void {

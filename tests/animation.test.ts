@@ -26,11 +26,14 @@ describe("automatic page-turn animation", () => {
     expect(smoothTurnProgress(0.6) - smoothTurnProgress(0.5)).toBeLessThan(0.12);
   });
 
-  it("extends a low-cadence turn instead of skipping large motion steps", () => {
-    expect(advanceAnimationTime(0, 32, 620, 30)).toBeCloseTo(1 / 30, 8);
+  it("keeps real-time pacing on steady displays and smooths only genuine hitches", () => {
+    // A steady 30Hz frame source advances in real time instead of stretching the turn.
+    expect(advanceAnimationTime(0, 32, 620, 30)).toBeCloseTo(32 / 620, 8);
     expect(advanceAnimationTime(0, 16, 620, 30)).toBeCloseTo(16 / 620, 8);
     expect(advanceAnimationTime(0.98, 100, 620, 30)).toBe(1);
-    expect(advanceAnimationTime(0, 100, 310, 30, 0.5)).toBeCloseTo(1 / 15, 8);
+    // A 100ms hitch is smoothed to at most ~90ms of progress, not jumped through.
+    expect(advanceAnimationTime(0, 100, 310, 30, 0.5)).toBeCloseTo(90 / 310, 8);
+    expect(advanceAnimationTime(0, 400, 620, 30)).toBeCloseTo(90 / 620, 8);
   });
 
   it("remaps nonlinear geometry to equal physical-motion intervals", () => {

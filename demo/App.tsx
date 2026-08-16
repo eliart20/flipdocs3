@@ -25,6 +25,7 @@ const pdfFixtures = [
   "FST Menachos (01) -236- (02a-11a).pdf",
   "FST Niddah (01)-284- (02a-11a).pdf",
   "Shir Hashirim HT.pdf",
+  "025 Niddah (20pp flat).pdf",
 ];
 
 const diagnosticCases: Array<{ value: DiagnosticCase; label: string }> = [
@@ -119,6 +120,13 @@ export function App() {
       setSource({ type: "images", pages: syntheticPages });
       return;
     }
+    if (choice === "niddah-images") {
+      setSource({
+        type: "images",
+        pages: Array.from({ length: 20 }, (_, index) => `/niddah-pages/p${String(index + 1).padStart(3, "0")}.jpg`),
+      });
+      return;
+    }
     const index = Number(choice);
     if (Number.isInteger(index)) setSource({ type: "pdf", src: `/test-pdfs/${index}` });
   };
@@ -195,6 +203,7 @@ export function App() {
             <span>Test document</span>
             <select value={sourceChoice} onChange={(event) => chooseSource(event.target.value)}>
               <option value="synthetic">Synthetic orientation book</option>
+              <option value="niddah-images">Niddah 20pp · pre-rendered images</option>
               {pdfFixtures.map((name, index) => <option key={name} value={index}>PDF {index + 1} · {name}</option>)}
               {sourceChoice === "local" && <option value="local">Local PDF</option>}
             </select>

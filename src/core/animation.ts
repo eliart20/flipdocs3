@@ -40,7 +40,12 @@ export function advanceAnimationTime(
   const boundedTravel = Math.min(1, Math.max(0.01, travel));
   const frameFloor = Math.max(2, Math.ceil(minimumFullTurnFrames * boundedTravel));
   const elapsedStep = Math.max(0, elapsedMs) / Math.max(1, durationMs);
-  return Math.min(1, boundedCurrent + Math.min(elapsedStep, 1 / frameFloor));
+  // A steady low-refresh display (30Hz) must keep real-time pacing — clamping
+  // it to the pose floor stretches every turn and makes the tail crawl. Only
+  // genuine hitches beyond ~90ms of lost time get smoothed instead of jumped.
+  const hitchStep = 90 / Math.max(1, durationMs);
+  const stepCap = Math.max(1 / frameFloor, hitchStep);
+  return Math.min(1, boundedCurrent + Math.min(elapsedStep, stepCap));
 }
 
 export interface EqualMotionPath {

@@ -27,7 +27,15 @@ async function initialize(src: string | Blob, baseUrl: string, parserWorkerUrl: 
   if (!fonts) throw new Error("This browser does not expose FontFaceSet to workers.");
   pdfjs.GlobalWorkerOptions.workerSrc = parserWorkerUrl;
   const opened = await openPdfDocument(pdfjs, src, baseUrl, {
-    ownerDocument: { fonts },
+    ownerDocument: {
+      fonts,
+      // pdf.js creates scratch canvases (patterns, masks, group rendering)
+      // through ownerDocument; hand it OffscreenCanvas equivalents.
+      createElement: (name: string) => {
+        if (name === "canvas") return new OffscreenCanvas(1, 1);
+        throw new Error(`The PDF raster worker cannot create <${name}> elements.`);
+      },
+    },
   });
   documentProxy = opened.document;
   loadingTask = opened.loadingTask;
