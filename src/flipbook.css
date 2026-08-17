@@ -4,7 +4,7 @@
   --flipdocs-border: rgba(255, 255, 255, 0.13);
   --flipdocs-text: #f7f4ed;
   --flipdocs-muted: #aeb5c2;
-  --flipdocs-accent: #d6ff72;
+  --flipdocs-accent: #d8e4e8;
   position: relative;
   display: block;
   width: 100%;
@@ -21,7 +21,7 @@
 }
 
 .flipdocs:focus-visible {
-  box-shadow: inset 0 0 0 2px var(--flipdocs-accent);
+  box-shadow: inset 0 0 0 1px rgba(216, 228, 232, 0.45);
 }
 
 .flipdocs:fullscreen {
