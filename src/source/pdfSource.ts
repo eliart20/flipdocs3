@@ -2,16 +2,21 @@ import type {
   PDFDocumentLoadingTask,
   PDFDocumentProxy,
 } from "pdfjs-dist";
+import pdfParserWorkerSource from "pdfjs-dist/build/pdf.worker.min.mjs?raw";
 import type { PageSource, PageSurface } from "./PageSource";
 import { openPdfDocument, type MessageFromPdfWorker, type MessageToPdfWorker } from "./pdfCommon";
+import PdfRasterWorker from "./pdfRasterWorker.ts?worker&inline";
 
-const WORKER_FILE = "pdf.worker.min.mjs";
+let parserWorkerUrl: string | undefined;
 
 function packagedWorkerUrl(): string {
-  if (import.meta.env.DEV && typeof window !== "undefined") {
-    return new URL(`/${WORKER_FILE}`, window.location.href).href;
+  if (!parserWorkerUrl) {
+    parserWorkerUrl = URL.createObjectURL(new Blob(
+      [pdfParserWorkerSource],
+      { type: "text/javascript" },
+    ));
   }
-  return new URL("./pdf.worker.min.mjs", import.meta.url).href;
+  return parserWorkerUrl;
 }
 
 /** Rasterizing off the main thread needs both a module worker and OffscreenCanvas 2D. */
@@ -42,7 +47,7 @@ class WorkerPdfPageSource implements PageSource {
   }
 
   static create(src: string | Blob, timeoutMs = 120_000): Promise<WorkerPdfPageSource> {
-    const worker = new Worker(new URL("./pdfRasterWorker.ts", import.meta.url), { type: "module" });
+    const worker = new PdfRasterWorker();
     return new Promise<WorkerPdfPageSource>((resolve, reject) => {
       const timeout = setTimeout(() => {
         worker.terminate();
