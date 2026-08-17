@@ -89,6 +89,7 @@
 }
 
 .flipdocs__controls-core {
+  position: relative;
   display: flex;
   min-height: 48px;
   align-items: center;
@@ -100,6 +101,26 @@
   box-shadow: 0 16px 38px rgba(0, 0, 0, 0.28);
   pointer-events: auto;
   backdrop-filter: blur(18px) saturate(135%);
+}
+
+.flipdocs__progress {
+  position: absolute;
+  right: 10px;
+  bottom: 3px;
+  left: 10px;
+  height: 2px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.13);
+  pointer-events: none;
+}
+
+.flipdocs__progress i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--flipdocs-accent);
+  transition: width 220ms ease;
 }
 
 .flipdocs__connector {
@@ -115,6 +136,12 @@
   background: var(--flipdocs-panel);
   box-shadow: 0 12px 30px rgba(0, 0, 0, 0.28);
   backdrop-filter: blur(18px) saturate(135%);
+}
+
+.flipdocs__controls .flipdocs__wing:disabled {
+  color: #616a76;
+  background: rgba(12, 16, 24, 0.72);
+  opacity: 1;
 }
 
 .flipdocs__wing--previous {
@@ -326,4 +353,5 @@
 
 @media (prefers-reduced-motion: reduce) {
   .flipdocs__spinner { animation-duration: 1.5s; }
+  .flipdocs__progress i { transition: none; }
 }

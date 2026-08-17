@@ -237,6 +237,9 @@ export const FlipBook = forwardRef<FlipBookHandle, FlipBookProps>(function FlipB
                 </button>
               </>
             )}
+            <span className="flipdocs__progress" aria-hidden="true">
+              <i style={{ width: `${snapshot.pageCount ? Math.min(100, (snapshot.page / snapshot.pageCount) * 100) : 0}%` }} />
+            </span>
           </div>
           <span className="flipdocs__connector" />
           <button className="flipdocs__wing flipdocs__wing--next" type="button" onClick={() => engineRef.current?.next()} disabled={atEnd} aria-label="Next page" aria-keyshortcuts={direction === "ltr" ? "ArrowRight" : "ArrowLeft"}>
