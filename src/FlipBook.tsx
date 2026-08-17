@@ -207,33 +207,41 @@ export const FlipBook = forwardRef<FlipBookHandle, FlipBookProps>(function FlipB
 
       {showControls && (
         <nav className="flipdocs__controls" aria-label="Document controls">
-          <button type="button" onClick={() => engineRef.current?.previous()} disabled={atStart} aria-label="Previous page" aria-keyshortcuts={direction === "ltr" ? "ArrowLeft" : "ArrowRight"}>
+          <button className="flipdocs__wing flipdocs__wing--previous" type="button" onClick={() => engineRef.current?.previous()} disabled={atStart} aria-label="Previous page" aria-keyshortcuts={direction === "ltr" ? "ArrowLeft" : "ArrowRight"}>
             <Icon name="previous" />
           </button>
-          <div className="flipdocs__page-count" aria-live="polite">
-            <span>{snapshot.page || 1}</span><i>/</i><span>{snapshot.pageCount || "—"}</span>
+          <span className="flipdocs__connector" />
+          <div className="flipdocs__controls-core">
+            <div className="flipdocs__page-count" aria-live="polite">
+              <span>{snapshot.page || 1}</span><i>/</i><span>{snapshot.pageCount || "—"}</span>
+            </div>
+            <span className="flipdocs__divider flipdocs__hint-divider" />
+            <span className="flipdocs__input-hint" aria-hidden="true">
+              <span className="flipdocs__input-hint--mobile"><b>↔</b><i>Swipe</i></span>
+            </span>
+            <span className="flipdocs__divider flipdocs__hint-divider flipdocs__hint-divider--after" />
+            <button type="button" onClick={() => engineRef.current?.zoomOut()} aria-label="Zoom out">
+              <Icon name="minus" />
+            </button>
+            <button type="button" className="flipdocs__zoom" onClick={() => engineRef.current?.resetZoom()} aria-label="Reset zoom">
+              {Math.round(snapshot.zoom * 100)}%
+            </button>
+            <button type="button" onClick={() => engineRef.current?.zoomIn()} aria-label="Zoom in">
+              <Icon name="plus" />
+            </button>
+            {showFullscreen && (
+              <>
+                <span className="flipdocs__divider flipdocs__fullscreen-divider" />
+                <button className="flipdocs__fullscreen" type="button" onClick={() => void engineRef.current?.toggleFullscreen()} aria-label="Toggle fullscreen">
+                  <Icon name="fullscreen" />
+                </button>
+              </>
+            )}
           </div>
-          <button type="button" onClick={() => engineRef.current?.next()} disabled={atEnd} aria-label="Next page" aria-keyshortcuts={direction === "ltr" ? "ArrowRight" : "ArrowLeft"}>
+          <span className="flipdocs__connector" />
+          <button className="flipdocs__wing flipdocs__wing--next" type="button" onClick={() => engineRef.current?.next()} disabled={atEnd} aria-label="Next page" aria-keyshortcuts={direction === "ltr" ? "ArrowRight" : "ArrowLeft"}>
             <Icon name="next" />
           </button>
-          <span className="flipdocs__divider" />
-          <button type="button" onClick={() => engineRef.current?.zoomOut()} aria-label="Zoom out">
-            <Icon name="minus" />
-          </button>
-          <button type="button" className="flipdocs__zoom" onClick={() => engineRef.current?.resetZoom()} aria-label="Reset zoom">
-            {Math.round(snapshot.zoom * 100)}%
-          </button>
-          <button type="button" onClick={() => engineRef.current?.zoomIn()} aria-label="Zoom in">
-            <Icon name="plus" />
-          </button>
-          {showFullscreen && (
-            <>
-              <span className="flipdocs__divider" />
-              <button type="button" onClick={() => void engineRef.current?.toggleFullscreen()} aria-label="Toggle fullscreen">
-                <Icon name="fullscreen" />
-              </button>
-            </>
-          )}
         </nav>
       )}
     </div>
