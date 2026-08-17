@@ -175,21 +175,13 @@ export const FlipBook = forwardRef<FlipBookHandle, FlipBookProps>(function FlipB
   const atEnd = snapshot.page >= snapshot.pageCount;
 
   const bounceWing = (side: "previous" | "next") => {
-    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
-
     const wing = rootRef.current?.querySelector<HTMLElement>(`.flipdocs__wing--${side}`);
-    const offset = side === "previous" ? -6 : 6;
 
-    wing?.animate(
-      [
-        { transform: "translateX(0)" },
-        { transform: `translateX(${offset}px)` },
-        { transform: "translateX(0)" },
-        { transform: `translateX(${offset * 0.35}px)` },
-        { transform: "translateX(0)" },
-      ],
-      { duration: 260, easing: "ease-out" },
-    );
+    if (!wing) return;
+    wing.classList.remove("is-bouncing");
+    void wing.offsetWidth;
+    wing.classList.add("is-bouncing");
+    window.setTimeout(() => wing.classList.remove("is-bouncing"), 280);
   };
 
   const goPrevious = () => {

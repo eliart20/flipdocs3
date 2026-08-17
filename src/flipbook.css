@@ -145,11 +145,26 @@
 }
 
 .flipdocs__wing--previous {
+  --flipdocs-bounce-distance: -6px;
+  --flipdocs-bounce-return: -2px;
   border-radius: 9px 14px 14px 9px !important;
 }
 
 .flipdocs__wing--next {
+  --flipdocs-bounce-distance: 6px;
+  --flipdocs-bounce-return: 2px;
   border-radius: 14px 9px 9px 14px !important;
+}
+
+.flipdocs__wing.is-bouncing {
+  animation: flipdocs-wing-bounce 260ms ease-out;
+}
+
+@keyframes flipdocs-wing-bounce {
+  0%, 100% { transform: translateX(0); }
+  35% { transform: translateX(var(--flipdocs-bounce-distance)); }
+  68% { transform: translateX(0); }
+  84% { transform: translateX(var(--flipdocs-bounce-return)); }
 }
 
 .flipdocs__page-count {
@@ -354,4 +369,5 @@
 @media (prefers-reduced-motion: reduce) {
   .flipdocs__spinner { animation-duration: 1.5s; }
   .flipdocs__progress i { transition: none; }
+  .flipdocs__wing.is-bouncing { animation: none; }
 }
