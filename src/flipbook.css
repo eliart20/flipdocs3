@@ -71,8 +71,8 @@
   pointer-events: auto;
 }
 
-.flipdocs__controls button:hover:not(:disabled),
-.flipdocs__controls button:focus-visible {
+.flipdocs__controls button:hover:not(:disabled):not([aria-disabled="true"]),
+.flipdocs__controls button:focus-visible:not([aria-disabled="true"]) {
   color: #121711;
   background: var(--flipdocs-accent);
   outline: none;
@@ -138,7 +138,7 @@
   backdrop-filter: blur(18px) saturate(135%);
 }
 
-.flipdocs__controls .flipdocs__wing:disabled {
+.flipdocs__controls .flipdocs__wing[aria-disabled="true"] {
   color: #616a76;
   background: rgba(12, 16, 24, 0.72);
   opacity: 1;

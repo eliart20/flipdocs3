@@ -67,6 +67,7 @@ export const FlipBook = forwardRef<FlipBookHandle, FlipBookProps>(function FlipB
   const rootRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const engineRef = useRef<FlipBookEngine | undefined>(undefined);
+  const boundaryGestureRef = useRef<{ pointerId: number; x: number; y: number } | null>(null);
   const callbackRef = useRef({ onReady, onPageChange, onZoomChange, onError });
   const [snapshot, setSnapshot] = useState<DiagnosticSnapshot>({ ...emptySnapshot, direction });
   const [loading, setLoading] = useState(true);
@@ -159,10 +160,10 @@ export const FlipBook = forwardRef<FlipBookHandle, FlipBookProps>(function FlipB
     if (!interactive) return;
     const engine = engineRef.current;
     if (!engine) return;
-    if (event.key === "ArrowRight") direction === "ltr" ? engine.next() : engine.previous();
-    else if (event.key === "ArrowLeft") direction === "ltr" ? engine.previous() : engine.next();
-    else if (event.key === "PageDown" || event.key === " ") engine.next();
-    else if (event.key === "PageUp") engine.previous();
+    if (event.key === "ArrowRight") direction === "ltr" ? goNext() : goPrevious();
+    else if (event.key === "ArrowLeft") direction === "ltr" ? goPrevious() : goNext();
+    else if (event.key === "PageDown" || event.key === " ") goNext();
+    else if (event.key === "PageUp") goPrevious();
     else if (event.key === "+" || event.key === "=") engine.zoomIn();
     else if (event.key === "-") engine.zoomOut();
     else if (event.key === "0") engine.resetZoom();
@@ -172,6 +173,34 @@ export const FlipBook = forwardRef<FlipBookHandle, FlipBookProps>(function FlipB
 
   const atStart = snapshot.page <= 1;
   const atEnd = snapshot.page >= snapshot.pageCount;
+
+  const bounceWing = (side: "previous" | "next") => {
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+
+    const wing = rootRef.current?.querySelector<HTMLElement>(`.flipdocs__wing--${side}`);
+    const offset = side === "previous" ? -6 : 6;
+
+    wing?.animate(
+      [
+        { transform: "translateX(0)" },
+        { transform: `translateX(${offset}px)` },
+        { transform: "translateX(0)" },
+        { transform: `translateX(${offset * 0.35}px)` },
+        { transform: "translateX(0)" },
+      ],
+      { duration: 260, easing: "ease-out" },
+    );
+  };
+
+  const goPrevious = () => {
+    if (atStart) bounceWing("previous");
+    else engineRef.current?.previous();
+  };
+
+  const goNext = () => {
+    if (atEnd) bounceWing("next");
+    else engineRef.current?.next();
+  };
 
   return (
     <div
@@ -183,8 +212,30 @@ export const FlipBook = forwardRef<FlipBookHandle, FlipBookProps>(function FlipB
       tabIndex={0}
       onKeyDown={handleKey}
       onPointerDownCapture={(event) => {
-        if (event.target === canvasRef.current) rootRef.current?.focus({ preventScroll: true });
+        if (event.target !== canvasRef.current) return;
+
+        rootRef.current?.focus({ preventScroll: true });
+        boundaryGestureRef.current = {
+          pointerId: event.pointerId,
+          x: event.clientX,
+          y: event.clientY,
+        };
       }}
+      onPointerUpCapture={(event) => {
+        const start = boundaryGestureRef.current;
+        boundaryGestureRef.current = null;
+
+        if (!start || start.pointerId !== event.pointerId) return;
+
+        const deltaX = event.clientX - start.x;
+        const deltaY = event.clientY - start.y;
+        if (Math.abs(deltaX) < 28 || Math.abs(deltaX) < Math.abs(deltaY) * 0.75) return;
+
+        const forward = direction === "ltr" ? deltaX < 0 : deltaX > 0;
+        if (forward && atEnd) bounceWing("next");
+        else if (!forward && atStart) bounceWing("previous");
+      }}
+      onPointerCancelCapture={() => { boundaryGestureRef.current = null; }}
       aria-label="Flipbook document viewer"
     >
       <canvas ref={canvasRef} className="flipdocs__canvas" aria-label="Rendered document pages" />
@@ -207,7 +258,7 @@ export const FlipBook = forwardRef<FlipBookHandle, FlipBookProps>(function FlipB
 
       {showControls && (
         <nav className="flipdocs__controls" aria-label="Document controls">
-          <button className="flipdocs__wing flipdocs__wing--previous" type="button" onClick={() => engineRef.current?.previous()} disabled={atStart} aria-label="Previous page" aria-keyshortcuts={direction === "ltr" ? "ArrowLeft" : "ArrowRight"}>
+          <button className="flipdocs__wing flipdocs__wing--previous" type="button" onClick={goPrevious} aria-disabled={atStart} aria-label="Previous page" aria-keyshortcuts={direction === "ltr" ? "ArrowLeft" : "ArrowRight"}>
             <Icon name="previous" />
           </button>
           <span className="flipdocs__connector" />
@@ -242,7 +293,7 @@ export const FlipBook = forwardRef<FlipBookHandle, FlipBookProps>(function FlipB
             </span>
           </div>
           <span className="flipdocs__connector" />
-          <button className="flipdocs__wing flipdocs__wing--next" type="button" onClick={() => engineRef.current?.next()} disabled={atEnd} aria-label="Next page" aria-keyshortcuts={direction === "ltr" ? "ArrowRight" : "ArrowLeft"}>
+          <button className="flipdocs__wing flipdocs__wing--next" type="button" onClick={goNext} aria-disabled={atEnd} aria-label="Next page" aria-keyshortcuts={direction === "ltr" ? "ArrowRight" : "ArrowLeft"}>
             <Icon name="next" />
           </button>
         </nav>
