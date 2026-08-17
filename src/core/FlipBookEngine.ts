@@ -580,7 +580,7 @@ export class FlipBookEngine {
       focus = from + (to - from) * this.focusSlide.progress;
     }
 
-    const padding = this.mobile ? 0.94 : 0.9;
+    const padding = 0.98;
     let viewWidth: number;
     let viewHeight: number;
     if (aspect >= contentWidth / this.pageHeight) {
