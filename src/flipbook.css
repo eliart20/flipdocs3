@@ -175,6 +175,10 @@
   display: flex;
 }
 
+.flipdocs[data-mode="mobile"] .flipdocs__input-hint--mobile {
+  display: flex;
+}
+
 .flipdocs[data-mode="mobile"] .flipdocs__hint-divider--after {
   display: block;
 }
