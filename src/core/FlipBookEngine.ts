@@ -519,7 +519,11 @@ export class FlipBookEngine {
     const width = Math.max(1, Math.round(rect.width));
     const height = Math.max(1, Math.round(rect.height));
     const wasMobile = this.mobile;
-    this.mobile = width <= this.mobileBreakpoint;
+    const viewportWidth = Math.max(
+      1,
+      window.innerWidth || document.documentElement.clientWidth,
+    );
+    this.mobile = viewportWidth <= this.mobileBreakpoint;
     this.renderer.setSize(width, height, false);
     const approximateViewWidth = this.mobile ? 1 + this.tuning.mobilePeek : 2.12;
     this.gapWorld = Math.max(0.002, (this.spine.widthPx / width) * approximateViewWidth);
