@@ -159,6 +159,10 @@ function tunnelReloadPlugin() {
 }
 
 export default defineConfig({
+  // Keep emitted worker URLs package-relative so consumers such as Next.js
+  // can resolve them instead of interpreting an absolute /assets path as a
+  // module import.
+  base: "./",
   plugins: [react(), regressionPdfPlugin(), tunnelReloadPlugin()],
   worker: {
     format: "es",
