@@ -173,6 +173,8 @@ export const FlipBook = forwardRef<FlipBookHandle, FlipBookProps>(function FlipB
 
   const atStart = snapshot.page <= 1;
   const atEnd = snapshot.page >= snapshot.pageCount;
+  const backwardWing = direction === "ltr" ? "previous" : "next";
+  const forwardWing = direction === "ltr" ? "next" : "previous";
 
   const bounceWing = (side: "previous" | "next") => {
     const wing = rootRef.current?.querySelector<HTMLElement>(`.flipdocs__wing--${side}`);
@@ -185,12 +187,12 @@ export const FlipBook = forwardRef<FlipBookHandle, FlipBookProps>(function FlipB
   };
 
   const goPrevious = () => {
-    if (atStart) bounceWing("previous");
+    if (atStart) bounceWing(backwardWing);
     else engineRef.current?.previous();
   };
 
   const goNext = () => {
-    if (atEnd) bounceWing("next");
+    if (atEnd) bounceWing(forwardWing);
     else engineRef.current?.next();
   };
 
@@ -224,8 +226,8 @@ export const FlipBook = forwardRef<FlipBookHandle, FlipBookProps>(function FlipB
         if (Math.abs(deltaX) < 28 || Math.abs(deltaX) < Math.abs(deltaY) * 0.75) return;
 
         const forward = direction === "ltr" ? deltaX < 0 : deltaX > 0;
-        if (forward && atEnd) bounceWing("next");
-        else if (!forward && atStart) bounceWing("previous");
+        if (forward && atEnd) bounceWing(forwardWing);
+        else if (!forward && atStart) bounceWing(backwardWing);
       }}
       onPointerCancelCapture={() => { boundaryGestureRef.current = null; }}
       aria-label="Flipbook document viewer"
@@ -250,7 +252,7 @@ export const FlipBook = forwardRef<FlipBookHandle, FlipBookProps>(function FlipB
 
       {showControls && (
         <nav className="flipdocs__controls" aria-label="Document controls">
-          <button className="flipdocs__wing flipdocs__wing--previous" type="button" onClick={goPrevious} aria-disabled={atStart} aria-label="Previous page" aria-keyshortcuts={direction === "ltr" ? "ArrowLeft" : "ArrowRight"}>
+          <button className="flipdocs__wing flipdocs__wing--previous" type="button" onClick={direction === "ltr" ? goPrevious : goNext} aria-disabled={direction === "ltr" ? atStart : atEnd} aria-label={direction === "ltr" ? "Previous page" : "Next page"} aria-keyshortcuts="ArrowLeft">
             <Icon name="previous" />
           </button>
           <span className="flipdocs__connector" />
@@ -285,7 +287,7 @@ export const FlipBook = forwardRef<FlipBookHandle, FlipBookProps>(function FlipB
             </span>
           </div>
           <span className="flipdocs__connector" />
-          <button className="flipdocs__wing flipdocs__wing--next" type="button" onClick={goNext} aria-disabled={atEnd} aria-label="Next page" aria-keyshortcuts={direction === "ltr" ? "ArrowRight" : "ArrowLeft"}>
+          <button className="flipdocs__wing flipdocs__wing--next" type="button" onClick={direction === "ltr" ? goNext : goPrevious} aria-disabled={direction === "ltr" ? atEnd : atStart} aria-label={direction === "ltr" ? "Next page" : "Previous page"} aria-keyshortcuts="ArrowRight">
             <Icon name="next" />
           </button>
         </nav>
